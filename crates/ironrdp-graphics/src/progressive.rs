@@ -17,7 +17,7 @@ use ironrdp_pdu::codecs::rfx::progressive::ComponentCodecQuant;
 
 use crate::dwt_extrapolate::BandInfo;
 use crate::rlgr::RlgrError;
-use crate::srl;
+use crate::srl::{self, SrlError};
 
 /// Number of DWT coefficients per component in a 64x64 tile.
 pub const COEFFICIENTS_PER_COMPONENT: usize = 4096;
@@ -122,6 +122,11 @@ fn decode_first_pass_to_dwtq(
 /// # Panics
 ///
 /// Panics if `coefficients` or `sign` has fewer than 4096 elements.
+///
+/// # Errors
+///
+/// Returns [`SrlError`] for a malformed or truncated SRL stream.
+/// See MS-RDPEGFX section 3.3.8.2.1.2.
 pub fn decode_upgrade_pass(
     srl_data: &[u8],
     raw_data: &[u8],
@@ -130,49 +135,70 @@ pub fn decode_upgrade_pass(
     use_reduce_extrapolate: bool,
     coefficients: &mut [i16],
     sign: &mut [i8],
-) {
+) -> Result<(), SrlError> {
     assert!(coefficients.len() >= COEFFICIENTS_PER_COMPONENT);
     assert!(sign.len() >= COEFFICIENTS_PER_COMPONENT);
 
     let bands = get_band_layout(use_reduce_extrapolate);
+    let zero_counts: [usize; NUM_BANDS] = core::array::from_fn(|band_idx| band_zero_count(sign, &bands[band_idx]));
+    let has_srl_values = bands.iter().enumerate().any(|(band_idx, _)| {
+        let num_bits = prev_prog_quant
+            .for_band(band_idx)
+            .saturating_sub(curr_prog_quant.for_band(band_idx));
+        band_idx != NUM_BANDS - 1 && num_bits != 0 && zero_counts[band_idx] != 0
+    });
+    let mut srl_decoder = has_srl_values.then(|| srl::SrlDecoder::new(srl_data)).transpose()?;
+    let mut srl_values = Vec::with_capacity(NUM_BANDS);
 
-    for (band_idx, band) in bands.iter().enumerate() {
+    for (band_idx, _) in bands.iter().enumerate() {
         let prev_bit_pos = prev_prog_quant.for_band(band_idx);
         let curr_bit_pos = curr_prog_quant.for_band(band_idx);
 
         // Number of raw bits per coefficient in this band
         let num_bits = prev_bit_pos.saturating_sub(curr_bit_pos);
         if num_bits == 0 {
+            srl_values.push(Vec::new());
             continue;
         }
 
-        // Count zero-DAS positions in this band (for SRL decode)
-        let zero_count = band_zero_count(sign, band);
+        if band_idx == NUM_BANDS - 1 {
+            // LL3 entries are always decoded from the raw stream.
+            srl_values.push(Vec::new());
+            continue;
+        }
 
-        // SRL decode for zero-DAS positions
-        let srl_values = srl::decode_srl(srl_data, zero_count, num_bits);
+        let zero_count = zero_counts[band_idx];
+        let values = match srl_decoder.as_mut() {
+            Some(decoder) => decoder.decode(zero_count, num_bits)?,
+            None => Vec::new(),
+        };
+        srl_values.push(values);
+    }
 
-        // Apply upgrade values to this band
+    let mut raw_reader = RawBitReader::new(raw_data);
+    for (band_idx, band) in bands.iter().enumerate() {
+        let prev_bit_pos = prev_prog_quant.for_band(band_idx);
+        let curr_bit_pos = curr_prog_quant.for_band(band_idx);
+        let num_bits = prev_bit_pos.saturating_sub(curr_bit_pos);
+        if num_bits == 0 {
+            continue;
+        }
+
+        let is_ll3 = band_idx == NUM_BANDS - 1;
         let mut srl_idx = 0;
-        let mut raw_reader = RawBitReader::new(raw_data);
 
         for i in 0..band.count() {
             let coeff_idx = band.offset + i;
-            let is_ll3 = band_idx == 9;
 
-            if sign[coeff_idx] == SIGN_ZERO {
+            if !is_ll3 && sign[coeff_idx] == SIGN_ZERO {
                 // Zero-DAS: get value from SRL stream
-                let value = if srl_idx < srl_values.len() {
-                    srl_values[srl_idx]
-                } else {
-                    0
-                };
+                let value = srl_values[band_idx][srl_idx];
                 srl_idx += 1;
 
                 if value != 0 {
                     // Coefficient transitions from zero to non-zero
                     let shifted = i32::from(value) << i32::from(curr_bit_pos);
-                    coefficients[coeff_idx] = clamp_i16(shifted);
+                    coefficients[coeff_idx] = clamp_i16(i32::from(coefficients[coeff_idx]) + shifted);
                     sign[coeff_idx] = if value > 0 { SIGN_POSITIVE } else { SIGN_NEGATIVE };
                 }
             } else {
@@ -194,6 +220,8 @@ pub fn decode_upgrade_pass(
             }
         }
     }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -373,7 +401,7 @@ fn quantize_component_ccq(coefficients: &mut [i16], quant: &ComponentCodecQuant,
 /// # Returns
 /// A tuple of `(srl_data, raw_data)` byte vectors.
 ///
-/// # Wire-format invariants (MS-RDPRFX 3.1.8.1.7.2)
+/// # Wire-format invariants (MS-RDPEGFX 3.2.8.1.5.2)
 ///
 /// The non-zero-DAS raw-magnitude path uses `saturating_sub` to compute
 /// `raw_mag = curr_q - prev_q`. Upgrade passes are *monotonic refinements*:
@@ -395,9 +423,10 @@ pub fn encode_upgrade_pass(
     curr_prog_quant: &ComponentCodecQuant,
     sign: &[i8],
     use_reduce_extrapolate: bool,
-) -> (Vec<u8>, Vec<u8>) {
+) -> Result<(Vec<u8>, Vec<u8>), SrlError> {
     let bands = get_band_layout(use_reduce_extrapolate);
-    let mut all_srl_values = Vec::new();
+    let mut srl_encoder = srl::SrlEncoder::new();
+    let mut has_srl_values = false;
     let mut raw_writer = RawBitWriter::new();
 
     for (band_idx, band) in bands.iter().enumerate() {
@@ -413,8 +442,9 @@ pub fn encode_upgrade_pass(
 
         for i in 0..band.count() {
             let coeff_idx = band.offset + i;
+            let is_ll3 = band_idx == NUM_BANDS - 1;
 
-            if sign[coeff_idx] == SIGN_ZERO {
+            if !is_ll3 && sign[coeff_idx] == SIGN_ZERO {
                 // Zero-DAS: compute the refined value and encode via SRL
                 let curr_shifted = i32::from(coefficients[coeff_idx]) >> i32::from(curr_bit_pos);
                 let prev_shifted = i32::from(prev_coefficients[coeff_idx]) >> i32::from(curr_bit_pos);
@@ -433,13 +463,19 @@ pub fn encode_upgrade_pass(
             }
         }
 
-        // Encode SRL values for this band
-        let srl_encoded = srl::encode_srl(&band_srl_values, num_bits);
-        all_srl_values.extend_from_slice(&srl_encoded);
+        if !band_srl_values.is_empty() {
+            srl_encoder.encode(&band_srl_values, num_bits)?;
+            has_srl_values = true;
+        }
     }
 
     let raw_data = raw_writer.finish();
-    (all_srl_values, raw_data)
+    let srl_data = if has_srl_values {
+        srl_encoder.finish()?
+    } else {
+        Vec::new()
+    };
+    Ok((srl_data, raw_data))
 }
 
 /// Encode RGBA pixels to spatial-domain i16 coefficients (RGB to YCbCr).
@@ -821,6 +857,7 @@ impl TileState {
     /// Decode an upgrade-pass tile (TILE_UPGRADE).
     ///
     /// Accumulates refinement data into existing coefficients.
+    /// On error, leaves the tile at its prior upgrade state.
     ///
     /// # Arguments
     /// - `srl_data`: SRL-encoded streams for [Y, Cb, Cr]
@@ -833,8 +870,10 @@ impl TileState {
         raw_data: [&[u8]; 3],
         prog_quants: [ComponentCodecQuant; 3],
         quality: u8,
-    ) {
+    ) -> Result<(), SrlError> {
         let prev_prog_quant = self.prog_quant;
+        let mut coefficients = self.coefficients;
+        let mut sign = self.sign;
 
         for c in 0..3 {
             decode_upgrade_pass(
@@ -843,14 +882,18 @@ impl TileState {
                 &prev_prog_quant[c],
                 &prog_quants[c],
                 self.use_reduce_extrapolate,
-                &mut self.coefficients[c],
-                &mut self.sign[c],
-            );
+                &mut coefficients[c],
+                &mut sign[c],
+            )?;
         }
 
+        self.coefficients = coefficients;
+        self.sign = sign;
         self.prog_quant = prog_quants;
         self.quality = quality;
         self.pass = self.pass.saturating_add(1);
+
+        Ok(())
     }
 
     /// Reconstruct the tile to spatial domain and write RGBA pixels.
@@ -1032,6 +1075,8 @@ pub enum ProgressiveDecodeError {
     Pdu(ironrdp_core::DecodeError),
     /// RLGR decode failed within a tile.
     Rlgr(RlgrError),
+    /// SRL decode failed within an upgrade tile.
+    Srl(SrlError),
     /// The progressive stream is missing a required block.
     MissingBlock(&'static str),
     /// Tile coordinates are out of bounds for the surface.
@@ -1047,6 +1092,7 @@ impl core::fmt::Display for ProgressiveDecodeError {
         match self {
             Self::Pdu(e) => write!(f, "progressive PDU decode: {e}"),
             Self::Rlgr(e) => write!(f, "progressive RLGR decode: {e}"),
+            Self::Srl(e) => write!(f, "progressive srl decode: {e}"),
             Self::MissingBlock(name) => write!(f, "progressive stream missing {name} block"),
             Self::TileOutOfBounds { x_idx, y_idx } => {
                 write!(f, "tile ({x_idx}, {y_idx}) out of surface bounds")
@@ -1074,6 +1120,12 @@ impl From<ironrdp_core::DecodeError> for ProgressiveDecodeError {
 impl From<RlgrError> for ProgressiveDecodeError {
     fn from(e: RlgrError) -> Self {
         Self::Rlgr(e)
+    }
+}
+
+impl From<SrlError> for ProgressiveDecodeError {
+    fn from(e: SrlError) -> Self {
+        Self::Srl(e)
     }
 }
 
@@ -1357,7 +1409,7 @@ fn decode_tile_block(
                 [tile.y_raw_data, tile.cb_raw_data, tile.cr_raw_data],
                 [pq.y_quant, pq.cb_quant, pq.cr_quant],
                 tile.quality,
-            );
+            )?;
 
             let mut pixels = vec![0u8; 64 * 64 * 4];
             tile_state.reconstruct_to_rgba(&mut pixels);
@@ -1604,7 +1656,8 @@ mod tests {
     #[test]
     fn upgrade_pass_zero_das_becomes_nonzero() {
         let mut coefficients = vec![0i16; 4096];
-        let mut sign = vec![SIGN_ZERO; 4096];
+        let mut sign = vec![SIGN_POSITIVE; 4096];
+        sign[0] = SIGN_ZERO;
 
         // Set up SRL data that produces a non-zero value for the first position
         // For band 0 (HL1), with num_bits=2, SRL should produce some values
@@ -1633,10 +1686,9 @@ mod tests {
             hh1: 0,
         };
 
-        // Simple SRL data: a non-zero value (the SRL decoder will interpret
-        // bits as magnitude + sign). With num_bits=2, k=0 initially,
-        // it goes straight to magnitude decode.
-        let srl_data = vec![0b01000000, 0x00]; // sign=0(+), magnitude bits follow
+        // Zero run 0 (10), positive sign (0), magnitude 1 (1), then the
+        // required trailing zero byte.
+        let srl_data = vec![0b1001_0000, 0x00];
         let raw_data = vec![];
 
         decode_upgrade_pass(
@@ -1647,10 +1699,97 @@ mod tests {
             false,
             &mut coefficients,
             &mut sign,
+        )
+        .unwrap();
+
+        assert_eq!(coefficients[0], 4);
+        assert_eq!(sign[0], SIGN_POSITIVE);
+    }
+
+    #[test]
+    fn upgrade_pass_preserves_component_streams_across_bands() {
+        // MS-RDPEGFX 4.1.2.1.2 treats SRL entries in different bands as
+        // consecutive. A component also has one raw bit stream for the upgrade.
+        let mut coefficients = [0i16; COEFFICIENTS_PER_COMPONENT];
+        let mut sign = [SIGN_POSITIVE; COEFFICIENTS_PER_COMPONENT];
+        sign[0] = SIGN_ZERO;
+        sign[1024] = SIGN_ZERO;
+
+        let mut prev_prog_quant = ComponentCodecQuant::LOSSLESS;
+        prev_prog_quant.hl1 = 1;
+        prev_prog_quant.lh1 = 1;
+
+        // The bits encode +1 in HL1 followed by -1 in LH1. The raw stream
+        // provides one bit for HL1 and then runs out before LH1.
+        decode_upgrade_pass(
+            &[0b1001_1000, 0x00],
+            &[0b1000_0000],
+            &prev_prog_quant,
+            &ComponentCodecQuant::LOSSLESS,
+            false,
+            &mut coefficients,
+            &mut sign,
+        )
+        .unwrap();
+
+        assert_eq!(coefficients[0], 1);
+        assert_eq!(coefficients[1024], -1);
+        assert_eq!(coefficients[1], 1);
+        assert_eq!(coefficients[1025], 0);
+    }
+
+    #[test]
+    fn upgrade_pass_rejects_truncated_srl() {
+        let mut coefficients = [0i16; COEFFICIENTS_PER_COMPONENT];
+        let mut sign = [SIGN_POSITIVE; COEFFICIENTS_PER_COMPONENT];
+        sign[0] = SIGN_ZERO;
+
+        let mut prev_prog_quant = ComponentCodecQuant::LOSSLESS;
+        prev_prog_quant.hl1 = 4;
+
+        assert_eq!(
+            decode_upgrade_pass(
+                &[0x80, 0x00],
+                &[],
+                &prev_prog_quant,
+                &ComponentCodecQuant::LOSSLESS,
+                false,
+                &mut coefficients,
+                &mut sign,
+            ),
+            Err(SrlError::Truncated)
+        );
+    }
+
+    #[test]
+    fn tile_upgrade_keeps_all_components_on_srl_error() {
+        let mut tile = TileState::new();
+        let mut prev_prog_quant = ComponentCodecQuant::LOSSLESS;
+        prev_prog_quant.hl1 = 4;
+        tile.prog_quant = [prev_prog_quant; 3];
+        tile.pass = 1;
+        tile.quality = 50;
+        tile.sign[0][0] = SIGN_ZERO;
+        tile.sign[1][0] = SIGN_ZERO;
+
+        let coefficients = tile.coefficients;
+        let sign = tile.sign;
+
+        assert_eq!(
+            tile.decode_upgrade(
+                [&[0x90, 0x00], &[0x80, 0x00], &[]],
+                [&[], &[], &[]],
+                [ComponentCodecQuant::LOSSLESS; 3],
+                75,
+            ),
+            Err(SrlError::Truncated)
         );
 
-        // After decode, at least some positions should have been updated
-        // (exact values depend on SRL interpretation, but the function shouldn't panic)
+        assert_eq!(tile.coefficients, coefficients);
+        assert_eq!(tile.sign, sign);
+        assert_eq!(tile.prog_quant, [prev_prog_quant; 3]);
+        assert_eq!(tile.pass, 1);
+        assert_eq!(tile.quality, 50);
     }
 
     #[test]
@@ -2224,9 +2363,349 @@ mod tests {
             &prog_quant,
             &sign,
             false,
-        );
+        )
+        .unwrap();
 
         assert!(srl_data.is_empty(), "no refinement bits, SRL should be empty");
         assert!(raw_data.is_empty(), "no refinement bits, raw should be empty");
+    }
+    // --- B12: Integration / round-trip tests ---
+
+    #[test]
+    fn first_pass_encode_decode_round_trip_lossless() {
+        // With LOSSLESS quants (all 1s), quantization is a no-op (shift by 0).
+        // The only error source is DWT integer truncation (LeGall 5/3).
+        //
+        // decode_first_pass returns frequency-domain coefficients (post-dequant),
+        // so we apply inverse DWT to get back to spatial domain for comparison.
+        let original = [42i16; COEFFICIENTS_PER_COMPONENT];
+        let mut encode_buf = original;
+        let mut output = vec![0u8; 16384];
+
+        let base_quant = ComponentCodecQuant::LOSSLESS;
+        let prog_quant = ComponentCodecQuant::LOSSLESS;
+
+        let bytes = encode_first_pass(&mut encode_buf, &mut output, &base_quant, &prog_quant, false).unwrap();
+
+        let mut decoded = [0i16; COEFFICIENTS_PER_COMPONENT];
+        let mut sign = [0i8; COEFFICIENTS_PER_COMPONENT];
+        decode_first_pass(
+            &output[..bytes],
+            &base_quant,
+            &prog_quant,
+            false,
+            &mut decoded,
+            &mut sign,
+        )
+        .unwrap();
+
+        // Inverse DWT to get back to spatial domain
+        let mut temp = [0i16; COEFFICIENTS_PER_COMPONENT];
+        crate::dwt::decode(&mut decoded, &mut temp);
+
+        let max_err = original
+            .iter()
+            .zip(decoded.iter())
+            .map(|(a, b)| (i32::from(*a) - i32::from(*b)).unsigned_abs())
+            .max()
+            .unwrap();
+
+        assert!(max_err <= 4, "flat data round-trip max error {max_err} exceeds 4");
+    }
+
+    #[test]
+    fn first_pass_encode_decode_round_trip_reduce_extrapolate() {
+        let original = [42i16; COEFFICIENTS_PER_COMPONENT];
+        let mut encode_buf = original;
+        let mut output = vec![0u8; 16384];
+
+        let base_quant = ComponentCodecQuant::LOSSLESS;
+        let prog_quant = ComponentCodecQuant::LOSSLESS;
+
+        let bytes = encode_first_pass(&mut encode_buf, &mut output, &base_quant, &prog_quant, true).unwrap();
+
+        let mut decoded = [0i16; COEFFICIENTS_PER_COMPONENT];
+        let mut sign = [0i8; COEFFICIENTS_PER_COMPONENT];
+        decode_first_pass(
+            &output[..bytes],
+            &base_quant,
+            &prog_quant,
+            true,
+            &mut decoded,
+            &mut sign,
+        )
+        .unwrap();
+
+        // Inverse DWT (reduce-extrapolate variant)
+        let mut temp = [0i16; COEFFICIENTS_PER_COMPONENT];
+        crate::dwt_extrapolate::decode(&mut decoded, &mut temp);
+
+        let max_err = original
+            .iter()
+            .zip(decoded.iter())
+            .map(|(a, b)| (i32::from(*a) - i32::from(*b)).unsigned_abs())
+            .max()
+            .unwrap();
+
+        assert!(
+            max_err <= 6,
+            "reduce-extrapolate round-trip max error {max_err} exceeds 6"
+        );
+    }
+
+    #[test]
+    fn first_pass_encode_decode_with_quantization() {
+        // Test encode/decode with realistic quantization (non-lossless).
+        // Quantization introduces controlled error, so we just verify
+        // the pipeline completes and the decoded output is in a sensible range.
+        let mut coefficients = [42i16; COEFFICIENTS_PER_COMPONENT];
+        let mut output = vec![0u8; 16384];
+
+        let base_quant = ComponentCodecQuant {
+            ll3: 6,
+            hl3: 6,
+            lh3: 6,
+            hh3: 6,
+            hl2: 7,
+            lh2: 7,
+            hh2: 7,
+            hl1: 8,
+            lh1: 8,
+            hh1: 8,
+        };
+        let prog_quant = ComponentCodecQuant::LOSSLESS;
+
+        let bytes = encode_first_pass(&mut coefficients, &mut output, &base_quant, &prog_quant, false).unwrap();
+        assert!(bytes > 0, "should produce encoded output");
+
+        // Quantized data should compress better than lossless
+        let mut decoded = [0i16; COEFFICIENTS_PER_COMPONENT];
+        let mut sign = [0i8; COEFFICIENTS_PER_COMPONENT];
+        decode_first_pass(
+            &output[..bytes],
+            &base_quant,
+            &prog_quant,
+            false,
+            &mut decoded,
+            &mut sign,
+        )
+        .unwrap();
+
+        // Inverse DWT
+        let mut temp = [0i16; COEFFICIENTS_PER_COMPONENT];
+        crate::dwt::decode(&mut decoded, &mut temp);
+
+        // With quantization, values should be approximately the original (42)
+        // but with significant quantization noise. Just check within +-200.
+        let mean_err: f64 = decoded
+            .iter()
+            .map(|v| f64::from((i32::from(*v) - 42).unsigned_abs()))
+            .sum::<f64>()
+            / 4096.0;
+
+        assert!(
+            mean_err < 200.0,
+            "mean error {mean_err} too large for quantized flat tile"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::similar_names, reason = "y/cb/cr are standard YCbCr component names")]
+    fn rgba_ycbcr_reconstruct_round_trip() {
+        // RGB -> YCbCr -> RGB. ITU-R BT.601 fixed-point round-trip carries a
+        // few units of integer-rounding error per channel. We assert a bounded
+        // per-channel max and verify Y/Cb/Cr stay in [-128, 127] in between.
+        let mut pixels = vec![0u8; 64 * 64 * 4];
+        for i in 0..64 * 64 {
+            // Smooth gradient
+            let row = i / 64;
+            let col = i % 64;
+            pixels[i * 4] = (row * 4) as u8; // R
+            pixels[i * 4 + 1] = (col * 4) as u8; // G
+            pixels[i * 4 + 2] = 128; // B
+            pixels[i * 4 + 3] = 255; // A
+        }
+
+        let mut y = vec![0i16; 4096];
+        let mut cb = vec![0i16; 4096];
+        let mut cr = vec![0i16; 4096];
+
+        rgba_to_ycbcr(&pixels, &mut y, &mut cb, &mut cr);
+
+        // Verify Y is in expected range [-128..127] and Cb/Cr in [-128..127]
+        for i in 0..4096 {
+            assert!(y[i] >= -128 && y[i] <= 127, "Y[{i}] = {} out of range", y[i]);
+            assert!(cb[i] >= -128 && cb[i] <= 127, "Cb[{i}] = {} out of range", cb[i]);
+            assert!(cr[i] >= -128 && cr[i] <= 127, "Cr[{i}] = {} out of range", cr[i]);
+        }
+
+        // Inverse YCbCr -> RGB using the same BT.601 matrix as
+        // TileState::reconstruct_to_rgba (the decode-side counterpart).
+        let mut max_err = 0i32;
+        for i in 0..64 * 64 {
+            let y_val = i32::from(y[i]) + 128;
+            let cb_val = i32::from(cb[i]);
+            let cr_val = i32::from(cr[i]);
+
+            let r_rec = (y_val + ((cr_val * 91881 + 32768) >> 16)).clamp(0, 255);
+            let g_rec = (y_val - ((cb_val * 22554 + cr_val * 46802 + 32768) >> 16)).clamp(0, 255);
+            let b_rec = (y_val + ((cb_val * 116130 + 32768) >> 16)).clamp(0, 255);
+
+            let off = i * 4;
+            let r_orig = i32::from(pixels[off]);
+            let g_orig = i32::from(pixels[off + 1]);
+            let b_orig = i32::from(pixels[off + 2]);
+
+            max_err = max_err.max((r_rec - r_orig).abs());
+            max_err = max_err.max((g_rec - g_orig).abs());
+            max_err = max_err.max((b_rec - b_orig).abs());
+        }
+        assert!(
+            max_err <= 2,
+            "RGB -> YCbCr -> RGB max per-channel error {max_err} exceeds 2"
+        );
+    }
+
+    #[test]
+    fn upgrade_pass_encode_decode_round_trip() {
+        // Two-pass refinement round-trip on the upgrade-pass wire format. Uses
+        // synthetic post-DWT post-quant coefficients to isolate the upgrade-pass
+        // mechanism from forward/inverse DWT and RLGR1 framing.
+        //
+        // The contract under test: encode_upgrade_pass(refined, prev, ...)
+        // followed by decode_upgrade_pass applied to prev must not increase the
+        // L1 distance to refined. The wire format is monotonic (encoder writes
+        // additive magnitude deltas with DAS-determined sign per MS-RDPRFX
+        // 3.1.8.1.7.2), so the post-decode distance cannot exceed pre-decode.
+        let prev_prog_quant = ComponentCodecQuant {
+            ll3: 0,
+            hl3: 0,
+            lh3: 0,
+            hh3: 0,
+            hl2: 0,
+            lh2: 0,
+            hh2: 0,
+            hl1: 4,
+            lh1: 0,
+            hh1: 0,
+        };
+        let curr_prog_quant = ComponentCodecQuant {
+            ll3: 0,
+            hl3: 0,
+            lh3: 0,
+            hh3: 0,
+            hl2: 0,
+            lh2: 0,
+            hh2: 0,
+            hl1: 2,
+            lh1: 0,
+            hh1: 0,
+        };
+
+        // Populate HL1 band (band index 0, offset 0, count 1024) with paired
+        // values: prev is coarser (low 4 bits zeroed), refined adds those bits.
+        let mut prev_coeffs = vec![0i16; COEFFICIENTS_PER_COMPONENT];
+        let mut refined_coeffs = vec![0i16; COEFFICIENTS_PER_COMPONENT];
+        let mut sign = vec![SIGN_ZERO; COEFFICIENTS_PER_COMPONENT];
+
+        for i in 0..1024 {
+            let base = ((i as i32) * 5) % 256 - 128;
+            let coarse = base & !0x0F;
+            let refined = base;
+            prev_coeffs[i] = coarse as i16;
+            refined_coeffs[i] = refined as i16;
+            sign[i] = match prev_coeffs[i].cmp(&0) {
+                core::cmp::Ordering::Greater => SIGN_POSITIVE,
+                core::cmp::Ordering::Less => SIGN_NEGATIVE,
+                core::cmp::Ordering::Equal => SIGN_ZERO,
+            };
+        }
+
+        let prev_dist: u32 = prev_coeffs
+            .iter()
+            .zip(refined_coeffs.iter())
+            .map(|(p, r)| (i32::from(*p) - i32::from(*r)).unsigned_abs())
+            .sum();
+
+        let (srl_data, raw_data) = encode_upgrade_pass(
+            &refined_coeffs,
+            &prev_coeffs,
+            &prev_prog_quant,
+            &curr_prog_quant,
+            &sign,
+            false,
+        )
+        .unwrap();
+
+        let mut decoded = prev_coeffs.clone();
+        let mut decoded_sign = sign.clone();
+        decode_upgrade_pass(
+            &srl_data,
+            &raw_data,
+            &prev_prog_quant,
+            &curr_prog_quant,
+            false,
+            &mut decoded,
+            &mut decoded_sign,
+        )
+        .unwrap();
+
+        let post_dist: u32 = decoded
+            .iter()
+            .zip(refined_coeffs.iter())
+            .map(|(d, r)| (i32::from(*d) - i32::from(*r)).unsigned_abs())
+            .sum();
+
+        // Upgrade pass must not move further from the refined target.
+        assert!(
+            post_dist <= prev_dist,
+            "upgrade pass must not increase distance to refined: prev_dist={prev_dist} post_dist={post_dist}"
+        );
+    }
+
+    #[test]
+    fn quantize_dequantize_ccq_round_trip() {
+        let quant = ComponentCodecQuant {
+            ll3: 4,
+            hl3: 4,
+            lh3: 4,
+            hh3: 5,
+            hl2: 5,
+            lh2: 5,
+            hh2: 6,
+            hl1: 6,
+            lh1: 6,
+            hh1: 7,
+        };
+
+        // Start with some known coefficient values
+        let original = {
+            let mut c = [0i16; COEFFICIENTS_PER_COMPONENT];
+            for (i, v) in c.iter_mut().enumerate() {
+                *v = ((i * 7 % 256) as i16) - 128;
+            }
+            c
+        };
+
+        let mut coefficients = original;
+
+        // Quantize then dequantize
+        quantize_component_ccq(&mut coefficients, &quant, false);
+        dequantize_component_ccq(&mut coefficients, &quant, false);
+
+        // Quantization is lossy, but the round-trip should be in the right ballpark.
+        // Error bound per coefficient: at most 2^(quant_val-1) per quantization step
+        // With quant values 4-7, max error per step is 2^6 = 64
+        let max_err = original
+            .iter()
+            .zip(coefficients.iter())
+            .map(|(a, b)| (i32::from(*a) - i32::from(*b)).unsigned_abs())
+            .max()
+            .unwrap();
+
+        assert!(
+            max_err <= 64,
+            "quantize/dequantize round-trip max error {max_err} exceeds 64"
+        );
     }
 }
