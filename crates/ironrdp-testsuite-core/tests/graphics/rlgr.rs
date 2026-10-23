@@ -663,3 +663,17 @@ const CR_DATA_DECODED: [i16; 4096] = [
     -38, -3, -1, 61, -68, 60, -4, -37, 1, -18, 2, 29, 29, 8, 18, -74, 10, 5, -17, -22, 108, -16, 33, -124, 22, -7, 0,
     -4, 48, 26, -46, -33,
 ];
+
+/// In RLGR3 the second value is the code remainder minus the first, which the
+/// stream sets: a first value larger than the remainder is invalid data, not
+/// an overflow.
+#[test]
+fn decode_rejects_rlgr3_values_larger_than_their_remainder() {
+    let mut output = [0; 64];
+    let result = decode(EntropyAlgorithm::Rlgr3, &[0x41, 0x1b], &mut output);
+
+    assert!(
+        matches!(result, Err(RlgrError::InvalidIntegralConversion(_))),
+        "expected an out-of-range error, got {result:?}"
+    );
+}
