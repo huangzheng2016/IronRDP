@@ -1120,6 +1120,16 @@ impl SurfaceTiles {
         self.tiles[idx].as_deref()
     }
 
+    fn get_mut(&mut self, x_idx: u16, y_idx: u16) -> Option<&mut TileState> {
+        let idx = self.tile_index(x_idx, y_idx)?;
+        self.tiles[idx].as_deref_mut()
+    }
+
+    /// Number of tiles that currently hold state.
+    pub fn populated_count(&self) -> usize {
+        self.tiles.iter().filter(|tile| tile.is_some()).count()
+    }
+
     /// Reset all tiles (e.g., on context reset or surface resize).
     pub fn reset(&mut self) {
         for tile in &mut self.tiles {
@@ -1161,6 +1171,37 @@ pub struct DecodedTile {
 /// `Vec<Option<Box<TileState>>>` is 512 * 512 = 262144 slots * 8 bytes per
 /// slot = 2 MiB of pointer storage per surface before any tile is populated.
 pub const MAX_SURFACE_DIM: u16 = 32768;
+
+/// Per-axis surface cap for [`ProgressiveDecoder::decode_bitmap`], in pixels.
+///
+/// Matches the EGFX compositor's surface cap. [`MAX_SURFACE_DIM`] stays at the
+/// protocol ceiling for direct users of [`SurfaceTiles`], but the decoder keeps
+/// per-tile state that a hostile server controls, so it refuses larger surfaces.
+const MAX_DECODE_SURFACE_DIM: u16 = 16384;
+
+/// Upper bound on the memory retained by tile state and sub-band references,
+/// across every surface of one [`ProgressiveDecoder`].
+///
+/// Each populated tile holds a [`TileState`] (about 36 KB) and a sub-band
+/// reference (about 24 KB). Without a bound a server can populate every tile of
+/// every surface it creates. 256 MiB holds roughly 4,400 tiles, which covers a
+/// 4K surface (about 2,040 tiles) with room for an offscreen surface.
+const MAX_RETAINED_BYTES: usize = 256 * 1024 * 1024;
+
+/// Upper bound on the decoded RGBA tile bytes one [`ProgressiveDecoder::decode_bitmap`]
+/// call may return. One region can reference thousands of tiles and a payload can
+/// carry many regions, so the output would otherwise grow with the wire size times
+/// a large constant. 128 MiB holds 8,192 tiles, a full 8K frame.
+const MAX_RETURNED_BYTES: usize = 128 * 1024 * 1024;
+
+const TILE_STATE_BYTES: usize = size_of::<TileState>();
+const REFERENCE_BYTES: usize = size_of::<DecDwtQ>();
+/// RGBA bytes of one 64x64 tile (`TILE_DIM` squared).
+const TILE_PIXEL_BYTES: usize = 64 * 64 * TILE_BYTES_PER_PIXEL;
+
+fn limit_exceeded(what: &'static str) -> ProgressiveDecodeError {
+    ProgressiveDecodeError::Pdu(invalid_field_err!("tiles", what))
+}
 
 /// Maximum aggregate rectangle visits while clipping one progressive bitmap payload.
 ///
@@ -1210,8 +1251,9 @@ impl core::fmt::Display for ProgressiveDecodeError {
             Self::SurfaceTooLarge { width, height } => {
                 write!(
                     f,
-                    "surface dimensions {width}x{height} exceed per-axis cap of {MAX_SURFACE_DIM} \
-                     (MS-RDPEGFX 2.2.2.14 normative ceiling: 32766)"
+                    "surface dimensions {width}x{height} exceed the supported per-axis cap \
+                     (tile grid ceiling {MAX_SURFACE_DIM}, decoder cap {MAX_DECODE_SURFACE_DIM}; \
+                     MS-RDPEGFX 2.2.2.14 normative ceiling: 32766)"
                 )
             }
         }
@@ -1286,6 +1328,10 @@ pub struct ProgressiveDecoder {
     references: BTreeMap<SubBandDiffingTileKey, DecDwtQ>,
     frame_tiles: BTreeMap<u16, BTreeSet<(u16, u16)>>,
     frame_active: bool,
+    /// Populated tiles across `surfaces`, charged at [`TILE_STATE_BYTES`] each.
+    tile_count: usize,
+    max_retained_bytes: usize,
+    max_returned_bytes: usize,
 }
 
 impl ProgressiveDecoder {
@@ -1296,6 +1342,9 @@ impl ProgressiveDecoder {
             references: BTreeMap::new(),
             frame_tiles: BTreeMap::new(),
             frame_active: false,
+            tile_count: 0,
+            max_retained_bytes: MAX_RETAINED_BYTES,
+            max_returned_bytes: MAX_RETURNED_BYTES,
         }
     }
 
@@ -1333,6 +1382,13 @@ impl ProgressiveDecoder {
     ) -> Result<Vec<DecodedTile>, ProgressiveDecodeError> {
         use ironrdp_pdu::codecs::rfx::progressive::{ProgressiveBlock, decode_progressive_stream};
 
+        if surface_width > MAX_DECODE_SURFACE_DIM || surface_height > MAX_DECODE_SURFACE_DIM {
+            return Err(ProgressiveDecodeError::SurfaceTooLarge {
+                width: surface_width,
+                height: surface_height,
+            });
+        }
+
         let blocks = decode_progressive_stream(bitmap_data)?;
 
         // Direct users of the decoder get one self-contained frame per call.
@@ -1342,6 +1398,12 @@ impl ProgressiveDecoder {
         }
 
         let (surfaces, references, all_frame_tiles) = (&mut self.surfaces, &mut self.references, &mut self.frame_tiles);
+        let mut budget = DecodeBudget {
+            tile_count: &mut self.tile_count,
+            max_retained_bytes: self.max_retained_bytes,
+            returned_bytes: 0,
+            max_returned_bytes: self.max_returned_bytes,
+        };
 
         // Every codec context on a surface decodes into the surface's tile grid.
         let surface = match surfaces.entry(surface_id) {
@@ -1354,7 +1416,9 @@ impl ProgressiveDecoder {
         let expected_high = surface_height.div_ceil(TILE_DIM);
         let surface_resized = surface.tiles_wide != expected_wide || surface.tiles_high != expected_high;
         if surface_resized {
-            *surface = SurfaceTiles::new(surface_width, surface_height, false)?;
+            let replacement = SurfaceTiles::new(surface_width, surface_height, false)?;
+            *budget.tile_count = budget.tile_count.saturating_sub(surface.populated_count());
+            *surface = replacement;
         }
 
         let frame_tiles = all_frame_tiles.entry(surface_id).or_default();
@@ -1398,6 +1462,7 @@ impl ProgressiveDecoder {
                     &region.quant_vals,
                     &region.quant_prog_vals,
                     use_reduce_extrapolate,
+                    &mut budget,
                 )?;
                 for tile in tiles {
                     let key = (tile.x_idx, tile.y_idx);
@@ -1466,8 +1531,7 @@ impl ProgressiveDecoder {
                     let Some(tile_state) = surface.get(x_idx, y_idx) else {
                         continue;
                     };
-                    let mut pixels = vec![0u8; usize::from(TILE_DIM) * usize::from(TILE_DIM) * TILE_BYTES_PER_PIXEL];
-                    tile_state.reconstruct_to_rgba(&mut pixels);
+                    let pixels = reconstruct_tile(tile_state, &mut budget)?;
                     DecodedTile {
                         x_idx,
                         y_idx,
@@ -1500,7 +1564,9 @@ impl ProgressiveDecoder {
     /// Call this when discarding a surface so a subsequent surface with the
     /// same ID cannot inherit stale Progressive tile state.
     pub fn delete_surface(&mut self, surface_id: u16) {
-        self.surfaces.remove(&surface_id);
+        if let Some(surface) = self.surfaces.remove(&surface_id) {
+            self.tile_count = self.tile_count.saturating_sub(surface.populated_count());
+        }
         self.references
             .retain(|(reference_surface_id, _, _), _| *reference_surface_id != surface_id);
         self.frame_tiles.remove(&surface_id);
@@ -1509,6 +1575,7 @@ impl ProgressiveDecoder {
     /// Reset tile state while retaining surface sub-band references.
     pub fn reset(&mut self) {
         self.surfaces.clear();
+        self.tile_count = 0;
         self.frame_tiles.clear();
         self.frame_active = false;
     }
@@ -1543,9 +1610,68 @@ fn progressive_quant_for(
         })
 }
 
+/// Memory accounting for one [`ProgressiveDecoder::decode_bitmap`] call.
+struct DecodeBudget<'a> {
+    /// Populated tiles across the decoder, shared with the decoder itself.
+    tile_count: &'a mut usize,
+    max_retained_bytes: usize,
+    /// Decoded RGBA tile bytes produced so far by this call.
+    returned_bytes: usize,
+    max_returned_bytes: usize,
+}
+
+impl DecodeBudget<'_> {
+    fn retained_bytes(&self, reference_count: usize) -> usize {
+        self.tile_count
+            .saturating_mul(TILE_STATE_BYTES)
+            .saturating_add(reference_count.saturating_mul(REFERENCE_BYTES))
+    }
+
+    /// Charge one new `TileState` together with the reference its first pass will add.
+    fn charge_tile(&mut self, reference_count: usize) -> Result<(), ProgressiveDecodeError> {
+        let needed = self
+            .retained_bytes(reference_count)
+            .saturating_add(TILE_STATE_BYTES)
+            .saturating_add(REFERENCE_BYTES);
+        if needed > self.max_retained_bytes {
+            return Err(limit_exceeded("progressive tile state memory limit exceeded"));
+        }
+        *self.tile_count += 1;
+        Ok(())
+    }
+
+    /// Check that one more sub-band reference fits.
+    fn check_reference(&self, reference_count: usize) -> Result<(), ProgressiveDecodeError> {
+        if self.retained_bytes(reference_count).saturating_add(REFERENCE_BYTES) > self.max_retained_bytes {
+            return Err(limit_exceeded("progressive reference memory limit exceeded"));
+        }
+        Ok(())
+    }
+
+    fn charge_returned(&mut self) -> Result<(), ProgressiveDecodeError> {
+        let total = self.returned_bytes.saturating_add(TILE_PIXEL_BYTES);
+        if total > self.max_returned_bytes {
+            return Err(limit_exceeded("progressive decoded tile output limit exceeded"));
+        }
+        self.returned_bytes = total;
+        Ok(())
+    }
+}
+
+fn reconstruct_tile(tile_state: &TileState, budget: &mut DecodeBudget<'_>) -> Result<Vec<u8>, ProgressiveDecodeError> {
+    budget.charge_returned()?;
+    let mut pixels = vec![0u8; TILE_PIXEL_BYTES];
+    tile_state.reconstruct_to_rgba(&mut pixels);
+    Ok(pixels)
+}
+
 #[expect(
     clippy::similar_names,
     reason = "q_y/q_cb/q_cr are standard component quant index names"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the tile decode inputs are distinct borrows; bundling them would only move the list"
 )]
 fn decode_tile_block(
     surface_id: u16,
@@ -1555,6 +1681,7 @@ fn decode_tile_block(
     quant_vals: &[ComponentCodecQuant],
     prog_quant_vals: &[ProgressiveCodecQuant],
     use_reduce_extrapolate: bool,
+    budget: &mut DecodeBudget<'_>,
 ) -> Result<Vec<DecodedTile>, ProgressiveDecodeError> {
     use ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile;
 
@@ -1577,6 +1704,12 @@ fn decode_tile_block(
             } else {
                 None
             };
+            if surface.get(x_idx, y_idx).is_none() {
+                budget.charge_tile(references.len())?;
+            }
+            if !references.contains_key(&reference_key) {
+                budget.check_reference(references.len())?;
+            }
             let tile_state = surface
                 .get_or_create(x_idx, y_idx)
                 .ok_or(ProgressiveDecodeError::TileOutOfBounds { x_idx, y_idx })?;
@@ -1608,8 +1741,7 @@ fn decode_tile_block(
             )?;
             references.insert(reference_key, tile_state.coefficients);
 
-            let mut pixels = vec![0u8; usize::from(TILE_DIM) * usize::from(TILE_DIM) * TILE_BYTES_PER_PIXEL];
-            tile_state.reconstruct_to_rgba(&mut pixels);
+            let pixels = reconstruct_tile(tile_state, budget)?;
 
             Ok(vec![DecodedTile {
                 x_idx,
@@ -1637,6 +1769,12 @@ fn decode_tile_block(
             } else {
                 None
             };
+            if surface.get(x_idx, y_idx).is_none() {
+                budget.charge_tile(references.len())?;
+            }
+            if !references.contains_key(&reference_key) {
+                budget.check_reference(references.len())?;
+            }
             let tile_state = surface
                 .get_or_create(x_idx, y_idx)
                 .ok_or(ProgressiveDecodeError::TileOutOfBounds { x_idx, y_idx })?;
@@ -1667,8 +1805,7 @@ fn decode_tile_block(
             )?;
             references.insert(reference_key, tile_state.coefficients);
 
-            let mut pixels = vec![0u8; usize::from(TILE_DIM) * usize::from(TILE_DIM) * TILE_BYTES_PER_PIXEL];
-            tile_state.reconstruct_to_rgba(&mut pixels);
+            let pixels = reconstruct_tile(tile_state, budget)?;
 
             Ok(vec![DecodedTile {
                 x_idx,
@@ -1682,14 +1819,14 @@ fn decode_tile_block(
             let x_idx = tile.x_idx;
             let y_idx = tile.y_idx;
 
-            let tile_state = surface
-                .get_or_create(x_idx, y_idx)
-                .ok_or(ProgressiveDecodeError::TileOutOfBounds { x_idx, y_idx })?;
-
-            // If this tile hasn't had a first pass, skip the upgrade
-            if tile_state.pass == 0 {
-                return Ok(Vec::new());
+            if surface.tile_index(x_idx, y_idx).is_none() {
+                return Err(ProgressiveDecodeError::TileOutOfBounds { x_idx, y_idx });
             }
+            // An upgrade refines an existing tile, so it never allocates one: a tile
+            // that has not had a first pass is skipped without growing the grid.
+            let Some(tile_state) = surface.get_mut(x_idx, y_idx).filter(|tile| tile.pass != 0) else {
+                return Ok(Vec::new());
+            };
 
             let pq = progressive_quant_for(tile.quality, prog_quant_vals)?;
 
@@ -1701,8 +1838,7 @@ fn decode_tile_block(
             )?;
             references.insert((surface_id, x_idx, y_idx), tile_state.coefficients);
 
-            let mut pixels = vec![0u8; usize::from(TILE_DIM) * usize::from(TILE_DIM) * TILE_BYTES_PER_PIXEL];
-            tile_state.reconstruct_to_rgba(&mut pixels);
+            let pixels = reconstruct_tile(tile_state, budget)?;
 
             Ok(vec![DecodedTile {
                 x_idx,
@@ -2206,6 +2342,86 @@ mod tests {
         decoder.delete_surface(1);
         assert_eq!(decoder.surfaces.len(), 1);
         assert!(decoder.surfaces.contains_key(&2));
+    }
+
+    #[test]
+    fn decoder_refuses_tile_state_beyond_the_retained_budget() {
+        let mut decoder = ProgressiveDecoder::new();
+        decoder.max_retained_bytes = TILE_STATE_BYTES + REFERENCE_BYTES - 1;
+
+        let result = decoder.decode_bitmap(1, 0, 64, 64, &simple_tile_stream(0, [1, 2, 3], true));
+
+        assert!(result.is_err(), "a tile that does not fit the budget must be refused");
+        assert_eq!(decoder.tile_count, 0);
+        assert!(decoder.references.is_empty());
+    }
+
+    #[test]
+    fn decoder_retained_budget_follows_surface_lifetime() {
+        let mut decoder = ProgressiveDecoder::new();
+        let stream = simple_tile_stream(0, [1, 2, 3], true);
+
+        decoder.max_retained_bytes = TILE_STATE_BYTES + REFERENCE_BYTES;
+        assert!(decoder.decode_bitmap(1, 0, 64, 64, &stream).is_ok());
+        assert_eq!(decoder.tile_count, 1);
+        assert!(
+            decoder.decode_bitmap(2, 0, 64, 64, &stream).is_err(),
+            "a second surface must not exceed the budget"
+        );
+
+        decoder.delete_surface(1);
+        assert_eq!(decoder.tile_count, 0);
+        assert!(decoder.references.is_empty());
+        assert!(
+            decoder.decode_bitmap(2, 0, 64, 64, &stream).is_ok(),
+            "deleting a surface returns its tiles to the budget"
+        );
+    }
+
+    #[test]
+    fn decoder_upgrade_of_an_unseen_tile_allocates_nothing() {
+        let mut decoder = ProgressiveDecoder::new();
+        let stream = upgrade_tile_stream(
+            &[],
+            ComponentCodecQuant::LOSSLESS,
+            ComponentCodecQuant::LOSSLESS,
+            ComponentCodecQuant::LOSSLESS,
+            true,
+        );
+
+        let tiles = decoder.decode_bitmap(1, 0, 64, 64, &stream).unwrap();
+
+        assert!(tiles.is_empty());
+        assert_eq!(decoder.tile_count, 0);
+        assert_eq!(decoder.surfaces[&1].populated_count(), 0);
+    }
+
+    #[test]
+    fn decoder_caps_decoded_tile_bytes_per_call() {
+        let mut decoder = ProgressiveDecoder::new();
+        decoder.max_returned_bytes = TILE_PIXEL_BYTES - 1;
+
+        let result = decoder.decode_bitmap(1, 0, 64, 64, &simple_tile_stream(0, [1, 2, 3], true));
+
+        assert!(result.is_err());
+
+        decoder.max_returned_bytes = TILE_PIXEL_BYTES;
+        let tiles = decoder
+            .decode_bitmap(1, 0, 64, 64, &simple_tile_stream(0, [1, 2, 3], true))
+            .unwrap();
+        assert_eq!(tiles.len(), 1);
+    }
+
+    #[test]
+    fn decoder_rejects_surfaces_beyond_the_decode_cap() {
+        let mut decoder = ProgressiveDecoder::new();
+        let stream = minimal_progressive_stream(true);
+
+        assert!(matches!(
+            decoder.decode_bitmap(1, 0, MAX_DECODE_SURFACE_DIM + 1, 64, &stream),
+            Err(ProgressiveDecodeError::SurfaceTooLarge { .. })
+        ));
+        assert!(decoder.surfaces.is_empty());
     }
 
     #[test]
