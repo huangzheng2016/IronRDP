@@ -221,6 +221,12 @@ impl Compositor {
         );
     }
 
+    /// Whether the compositor holds a canvas for `id`. A surface it refused (too
+    /// large, or over budget) has none, and decoding into it is wasted work.
+    pub(crate) fn has_surface(&self, id: u16) -> bool {
+        self.surfaces.contains_key(&id)
+    }
+
     /// Handle `DeleteSurface`.
     pub(crate) fn delete_surface(&mut self, id: u16) {
         if let Some(surface) = self.surfaces.remove(&id) {

@@ -695,10 +695,10 @@ impl GraphicsPipelineClient {
         if let Some(ref mut decoder) = self.h264_decoder {
             decoder.reset();
         }
-        // The Progressive decoder is deliberately NOT reset here either. Its context lifetime
-        // is driven by DeleteEncodingContext and DeleteSurface; MS-RDPEGFX 3.3.5.14 only
-        // resizes the Graphics Output Buffer. Dropping it here would discard the tile state
-        // that later upgrade passes refine.
+        // ResetGraphics implicitly destroys every surface, and Progressive tile state and
+        // sub-band references are keyed by surface, so none of it can be referenced again.
+        // Keeping it would also leave the server's tile memory charged to this client.
+        self.progressive_decoder = ProgressiveDecoder::new();
         // The ClearCodec decoder is deliberately NOT reset here. MS-RDPEGFX 3.3.5.14 only
         // resizes the Graphics Output Buffer; cache lifetime is driven by the stream instead,
         // through CLEARCODEC_FLAG_CACHE_RESET (2.2.4.1), which ClearCodecDecoder::decode
@@ -727,6 +727,8 @@ impl GraphicsPipelineClient {
         };
 
         debug!(surface_id, width, height, ?pixel_format, "Surface created");
+        // A new surface must not inherit Progressive state left by one that used the id.
+        self.progressive_decoder.delete_surface(surface_id);
         self.compositor.create_surface(surface_id, width, height);
         self.handler.on_surface_created(&surface);
         self.surfaces.insert(surface_id, surface);
@@ -825,6 +827,18 @@ impl GraphicsPipelineClient {
             .get(&pdu.surface_id)
             .ok_or_else(|| pdu_other_err!("unknown surface in WireToSurface2"))?;
         let (surface_width, surface_height) = (surface.width, surface.height);
+
+        // The compositor refuses oversized surfaces and surfaces past its memory
+        // budget. Decoding into one would still allocate tile state for nothing.
+        if !self.compositor.has_surface(pdu.surface_id) {
+            self.drop_update(
+                pdu.codec_id,
+                pdu.surface_id,
+                pdu.bitmap_data.len(),
+                &"surface refused by compositor",
+            );
+            return Ok(());
+        }
 
         let tiles = match self.progressive_decoder.decode_bitmap(
             pdu.surface_id,
@@ -1053,8 +1067,37 @@ impl GraphicsPipelineClient {
 
     fn handle_uncompressed(&mut self, pdu: crate::pdu::WireToSurface1Pdu) {
         // MS-RDPEGFX 2.2.1.4.1: see decode_avc420 above for wire-format note.
-        let dest_width = pdu.destination_rectangle.right - pdu.destination_rectangle.left;
-        let dest_height = pdu.destination_rectangle.bottom - pdu.destination_rectangle.top;
+        let (Some(dest_width), Some(dest_height)) = (
+            pdu.destination_rectangle
+                .right
+                .checked_sub(pdu.destination_rectangle.left),
+            pdu.destination_rectangle
+                .bottom
+                .checked_sub(pdu.destination_rectangle.top),
+        ) else {
+            warn!(
+                surface_id = pdu.surface_id,
+                "Dropping uncompressed bitmap with an inverted rectangle"
+            );
+            return;
+        };
+
+        // The payload must be exactly width * height * 4 bytes. A hostile server
+        // can pair a large rectangle with a tiny payload, which downstream
+        // consumers index by rectangle size.
+        let expected_len = usize::from(dest_width)
+            .checked_mul(usize::from(dest_height))
+            .and_then(|pixels| pixels.checked_mul(4));
+        if expected_len != Some(pdu.bitmap_data.len()) {
+            warn!(
+                surface_id = pdu.surface_id,
+                payload_len = pdu.bitmap_data.len(),
+                width = dest_width,
+                height = dest_height,
+                "Dropping uncompressed bitmap whose payload does not match its rectangle"
+            );
+            return;
+        }
 
         // Convert wire-format pixels to RGBA.
         // BitmapUpdate.data is always RGBA8888 regardless of codec -- this is
@@ -2027,18 +2070,56 @@ mod tests {
         client
     }
 
+    /// ResetGraphics destroys every surface, so the Progressive tile state and
+    /// sub-band references of the previous stream must not carry over to a surface
+    /// that reuses an id. Earlier revisions retained them across a reset.
     #[test]
-    fn progressive_context_survives_graphics_reset() {
+    fn progressive_state_is_dropped_on_graphics_reset() {
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let client = wire_difference_tile_after(|client| {
+            client.handler = Box::new(CapturingHandler {
+                updates: Arc::clone(&updates),
+                unhandled: Arc::new(Mutex::new(0)),
+            });
+            client
+                .handle_pdu(GfxPdu::ResetGraphics(crate::pdu::ResetGraphicsPdu {
+                    width: 64,
+                    height: 64,
+                    monitors: vec![],
+                }))
+                .unwrap();
+            client
+                .handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+                    surface_id: 1,
+                    width: 64,
+                    height: 64,
+                    pixel_format: PixelFormat::XRgb,
+                }))
+                .unwrap();
+        });
+
+        assert_eq!(client.dropped_updates(), 1, "the stale sub-band reference must be gone");
+        assert!(updates.lock().unwrap().is_empty());
+
+        // An UPGRADE has no first-pass tile to refine on the new surface and is skipped.
+        let mut client = client;
+        wire_progressive(&mut client, progressive_upgrade_stream()).unwrap();
+        assert!(
+            updates.lock().unwrap().is_empty(),
+            "UPGRADE must not resurrect old tiles"
+        );
+    }
+
+    /// After a reset a stream without SYNC and CONTEXT blocks still decodes: Windows
+    /// does not repeat them, and the decoder does not need them.
+    #[test]
+    fn progressive_first_tile_without_context_decodes_after_graphics_reset() {
         let updates = Arc::new(Mutex::new(Vec::new()));
         let mut client = progressive_client();
         client.handler = Box::new(CapturingHandler {
             updates: Arc::clone(&updates),
             unhandled: Arc::new(Mutex::new(0)),
         });
-        wire_progressive(&mut client, progressive_tile_stream(0, 0, rect(0, 0, 64, 64), 0)).unwrap();
-        assert_eq!(updates.lock().unwrap().len(), 1);
-        updates.lock().unwrap().clear();
-
         client
             .handle_pdu(GfxPdu::ResetGraphics(crate::pdu::ResetGraphicsPdu {
                 width: 64,
@@ -2055,13 +2136,125 @@ mod tests {
             }))
             .unwrap();
 
-        // Windows never re-sends SYNC + CONTEXT after a reset, so a CONTEXT-less
-        // continuation has to keep decoding.
-        wire_progressive(&mut client, progressive_upgrade_stream()).unwrap();
+        wire_progressive(&mut client, progressive_tile_stream(0, 0, rect(0, 0, 64, 64), 0)).unwrap();
+
         assert_eq!(client.dropped_updates(), 0);
+        assert_eq!(updates.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn progressive_state_is_dropped_when_a_surface_id_is_recreated() {
+        let client = wire_difference_tile_after(|client| {
+            client
+                .handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+                    surface_id: 1,
+                    width: 64,
+                    height: 64,
+                    pixel_format: PixelFormat::XRgb,
+                }))
+                .unwrap();
+        });
+
+        assert_eq!(client.dropped_updates(), 1);
+    }
+
+    #[test]
+    fn progressive_bitmap_for_a_surface_the_compositor_refused_is_dropped() {
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let mut client = progressive_client();
+        client.handler = Box::new(CapturingHandler {
+            updates: Arc::clone(&updates),
+            unhandled: Arc::new(Mutex::new(0)),
+        });
+        // Wider than the compositor's surface cap: tracked as metadata, but no canvas.
+        client
+            .handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+                surface_id: 1,
+                width: 20_000,
+                height: 64,
+                pixel_format: PixelFormat::XRgb,
+            }))
+            .unwrap();
+
+        wire_progressive(&mut client, progressive_tile_stream(0, 0, rect(0, 0, 64, 64), 0)).unwrap();
+
+        assert_eq!(client.dropped_updates(), 1);
+        assert!(updates.lock().unwrap().is_empty());
+    }
+
+    fn uncompressed_client(updates: &Arc<Mutex<Vec<CapturedUpdate>>>) -> GraphicsPipelineClient {
+        let mut client = GraphicsPipelineClient::new(
+            Box::new(CapturingHandler {
+                updates: Arc::clone(updates),
+                unhandled: Arc::new(Mutex::new(0)),
+            }),
+            None,
+        );
+        client
+            .handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+                surface_id: 1,
+                width: 4096,
+                height: 4096,
+                pixel_format: PixelFormat::XRgb,
+            }))
+            .unwrap();
+        client
+    }
+
+    fn wire_uncompressed(client: &mut GraphicsPipelineClient, rect: ExclusiveRectangle, bitmap_data: Vec<u8>) {
+        client
+            .handle_pdu(GfxPdu::WireToSurface1(crate::pdu::WireToSurface1Pdu {
+                surface_id: 1,
+                codec_id: Codec1Type::Uncompressed,
+                pixel_format: PixelFormat::XRgb,
+                destination_rectangle: rect,
+                bitmap_data,
+            }))
+            .unwrap();
+    }
+
+    /// A tiny payload paired with a large rectangle must be dropped, not forwarded
+    /// to consumers that index it by rectangle size.
+    #[test]
+    fn uncompressed_bitmap_with_a_short_payload_is_dropped() {
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let mut client = uncompressed_client(&updates);
+        let rect = ExclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 4096,
+            bottom: 4096,
+        };
+
+        wire_uncompressed(&mut client, rect.clone(), vec![0; 4]);
+        wire_uncompressed(&mut client, rect, vec![0; 4096 * 4096 * 4 + 4]);
+        assert!(updates.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn uncompressed_bitmap_with_a_matching_payload_is_delivered() {
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let mut client = uncompressed_client(&updates);
+
+        wire_uncompressed(
+            &mut client,
+            ExclusiveRectangle {
+                left: 1,
+                top: 1,
+                right: 3,
+                bottom: 2,
+            },
+            vec![0x10, 0x20, 0x30, 0x00, 0x40, 0x50, 0x60, 0x00],
+        );
+
         let updates = updates.lock().unwrap();
-        assert_eq!(updates.len(), 1, "UPGRADE must retain its first-pass tile");
-        assert_eq!(&updates[0].3[..4], &[128, 128, 128, 255]);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            (updates[0].1, updates[0].2),
+            (2, 1),
+            "width and height come from the rectangle"
+        );
+        assert_eq!(updates[0].3, vec![0x30, 0x20, 0x10, 0xFF, 0x60, 0x50, 0x40, 0xFF]);
     }
 
     #[test]
