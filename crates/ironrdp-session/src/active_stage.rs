@@ -279,6 +279,10 @@ impl ActiveStage {
         if let Some(dvc) = self.get_dvc::<DisplayControlClient>() {
             if let Some(channel_id) = dvc.channel_id() {
                 let display_control = dvc.channel_processor_downcast_ref::<DisplayControlClient>()?;
+                if !display_control.ready() {
+                    debug!("Could not encode a resize: Display Control capabilities have not been received");
+                    return None;
+                }
                 let svc_messages = match display_control.encode_single_primary_monitor(
                     channel_id,
                     width,

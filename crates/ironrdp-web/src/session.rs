@@ -23,6 +23,8 @@ use ironrdp::connector::{self, ClientConnector, Credentials};
 use ironrdp::displaycontrol::client::DisplayControlClient;
 use ironrdp::dvc::DrdynvcClient;
 use ironrdp::graphics::image_processing::PixelFormat;
+use ironrdp::graphics::progressive::ProgressiveDecoder;
+use ironrdp::pdu::geometry::InclusiveRectangle;
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp::pdu::rdp::capability_sets::client_codecs_capabilities;
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
@@ -32,6 +34,8 @@ use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd};
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStage, ActiveStageOutput, GracefulDisconnectReason, fast_path};
 use ironrdp_core::WriteBuf;
+use ironrdp_egfx::client::{BitmapUpdate, GraphicsPipelineClient, GraphicsPipelineHandler};
+use ironrdp_egfx::pdu::{CapabilitySet, WireToSurface2Pdu};
 use ironrdp_futures::{FramedWrite, single_sequence_step_read};
 use rgb::AsPixels as _;
 use tap::prelude::*;
@@ -469,6 +473,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
         let (connection_result, ws) = connect(ConnectParams {
             ws,
             config,
+            input_events_tx: input_events_tx.clone(),
             proxy_auth_token: auth_token,
             destination,
             pcb,
@@ -512,8 +517,123 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
 
 pub(crate) type FastPathInputEvents = smallvec::SmallVec<[FastPathInputEvent; 2]>;
 
+struct WasmGraphicsPipelineHandler {
+    events: mpsc::UnboundedSender<RdpInputEvent>,
+    width: u16,
+    height: u16,
+    progressive: ProgressiveDecoder,
+}
+
+impl WasmGraphicsPipelineHandler {
+    fn emit(&self, region: InclusiveRectangle, data: Vec<u8>) {
+        if self
+            .events
+            .unbounded_send(RdpInputEvent::GraphicsUpdate(region, data))
+            .is_err()
+        {
+            warn!("Graphics update received after the session event loop stopped");
+        }
+    }
+
+    fn emit_tile(&self, tile_x: u16, tile_y: u16, pixels: Vec<u8>) {
+        let left = tile_x.saturating_mul(64);
+        let top = tile_y.saturating_mul(64);
+        let right = left.saturating_add(64).min(self.width);
+        let bottom = top.saturating_add(64).min(self.height);
+        if right <= left || bottom <= top {
+            return;
+        }
+        let width = usize::from(right - left);
+        let height = usize::from(bottom - top);
+        let mut data = Vec::with_capacity(width * height * 4);
+        for row in pixels.chunks_exact(256).take(height) {
+            data.extend_from_slice(&row[..width * 4]);
+        }
+        self.emit(
+            InclusiveRectangle {
+                left,
+                top,
+                right: right - 1,
+                bottom: bottom - 1,
+            },
+            data,
+        );
+    }
+}
+
+impl GraphicsPipelineHandler for WasmGraphicsPipelineHandler {
+    fn on_capabilities_confirmed(&mut self, caps: &CapabilitySet) {
+        info!(?caps, "EGFX capabilities confirmed");
+    }
+
+    fn on_reset_graphics(&mut self, width: u32, height: u32) {
+        info!(width, height, "EGFX graphics reset");
+        let (Ok(width), Ok(height)) = (u16::try_from(width), u16::try_from(height)) else {
+            warn!(width, height, "EGFX graphics reset has unsupported dimensions");
+            return;
+        };
+        self.width = width;
+        self.height = height;
+        self.progressive = ProgressiveDecoder::new();
+        if self
+            .events
+            .unbounded_send(RdpInputEvent::GraphicsReset { width, height })
+            .is_err()
+        {
+            warn!("Graphics reset received after the session event loop stopped");
+        }
+    }
+
+    fn on_bitmap_updated(&mut self, update: &BitmapUpdate) {
+        let rect = &update.destination_rectangle;
+        if update.data.is_empty() || rect.right <= rect.left || rect.bottom <= rect.top {
+            return;
+        }
+        info!(
+            width = update.width,
+            height = update.height,
+            bytes = update.data.len(),
+            "Uncompressed graphics update"
+        );
+        self.emit(
+            InclusiveRectangle {
+                left: rect.left,
+                top: rect.top,
+                right: rect.right - 1,
+                bottom: rect.bottom - 1,
+            },
+            update.data.clone(),
+        );
+    }
+
+    fn on_wire_to_surface2(&mut self, pdu: &WireToSurface2Pdu) {
+        match self
+            .progressive
+            .decode_bitmap(pdu.codec_context_id, self.width, self.height, &pdu.bitmap_data)
+        {
+            Ok(tiles) => {
+                info!(
+                    width = self.width,
+                    height = self.height,
+                    tiles = tiles.len(),
+                    "Progressive graphics update decoded"
+                );
+                for tile in tiles {
+                    self.emit_tile(tile.x_idx, tile.y_idx, tile.pixels);
+                }
+            }
+            Err(error) => warn!(%error, "Progressive bitmap decode failed"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum RdpInputEvent {
+    GraphicsReset {
+        width: u16,
+        height: u16,
+    },
+    GraphicsUpdate(InclusiveRectangle, Vec<u8>),
     Cliprdr(ClipboardMessage),
     ClipboardBackend(WasmClipboardBackendMessage),
     /// Printer backend → event loop: a print job finished and its bytes are
@@ -798,6 +918,21 @@ impl iron_remote_desktop::Session for Session {
                                 }
                             }
                         }
+                        RdpInputEvent::GraphicsReset { width, height } => {
+                            let (surface_width, surface_height) = (width, height);
+                            let width = NonZeroU32::new(u32::from(width)).context("EGFX width is zero")?;
+                            let height = NonZeroU32::new(u32::from(height)).context("EGFX height is zero")?;
+                            self.render_canvas.set_width(width.get());
+                            self.render_canvas.set_height(height.get());
+                            gui.resize(width, height);
+                            image = DecodedImage::new(PixelFormat::RgbA32, surface_width, surface_height);
+                            requested_resize = None;
+                            Vec::new()
+                        }
+                        RdpInputEvent::GraphicsUpdate(region, data) => {
+                            let updated = image.apply_rgba32_bitmap(&data, &region)?;
+                            vec![ActiveStageOutput::GraphicsUpdate(updated)]
+                        }
                         RdpInputEvent::FastPath(events) => {
                             active_stage.process_fastpath_input(&mut image, &events)
                                 .context("fast path input events processing")?
@@ -814,7 +949,7 @@ impl iron_remote_desktop::Session for Session {
                                 requested_resize = Some((width, height));
                                 vec![ActiveStageOutput::ResponseFrame(response_frame?)]
                             } else {
-                                debug!("Resize event ignored");
+                                warn!("Resize request was not sent: Display Control is unavailable or not ready");
                                 Vec::new()
                             }
                         },
@@ -976,15 +1111,6 @@ impl iron_remote_desktop::Session for Session {
                         // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dfc234ce-481a-4674-9a5d-2a7bafb14432
                         debug!("Received Server Deactivate All PDU, executing Deactivation-Reactivation Sequence");
 
-                        // We need to perform resize after receiving the Deactivate All PDU, because there may be frames
-                        // with the previous dimensions arriving between the resize request and this message.
-                        if let Some((width, height)) = requested_resize {
-                            self.render_canvas.set_width(width.get());
-                            self.render_canvas.set_height(height.get());
-                            gui.resize(width, height);
-                            requested_resize = None;
-                        }
-
                         let mut buf = WriteBuf::new();
                         'activation_seq: loop {
                             let written =
@@ -1007,6 +1133,16 @@ impl iron_remote_desktop::Session for Session {
                             } = box_connection_activation.connection_activation_state()
                             {
                                 debug!("Deactivation-Reactivation Sequence completed");
+                                if requested_resize.is_some() {
+                                    let width = NonZeroU32::new(u32::from(desktop_size.width))
+                                        .expect("desktop width is guaranteed to be non-zero");
+                                    let height = NonZeroU32::new(u32::from(desktop_size.height))
+                                        .expect("desktop height is guaranteed to be non-zero");
+                                    self.render_canvas.set_width(width.get());
+                                    self.render_canvas.set_height(height.get());
+                                    gui.resize(width, height);
+                                    requested_resize = None;
+                                }
                                 image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
                                 // Create a new [`FastPathProcessor`] with potentially updated
                                 // io/user channel ids.
@@ -1402,8 +1538,8 @@ fn build_config(
             height: desktop_size.height,
         },
         bitmap: Some(connector::BitmapConfig {
-            color_depth: 16,
-            lossy_compression: true,
+            color_depth: 32,
+            lossy_compression: false,
             codecs: client_codecs_capabilities(&[]).expect("can't panic for &[]"),
         }),
         #[expect(
@@ -1426,6 +1562,7 @@ fn build_config(
         request_data: None,
         pointer_software_rendering: false,
         multitransport_flags: None,
+        support_dyn_vc_gfx_protocol: true,
         performance_flags: PerformanceFlags::default(),
         desktop_scale_factor: 0,
         hardware_id: None,
@@ -1477,6 +1614,7 @@ async fn writer_task(
 struct ConnectParams {
     ws: WebSocket,
     config: connector::Config,
+    input_events_tx: mpsc::UnboundedSender<RdpInputEvent>,
     proxy_auth_token: String,
     destination: String,
     pcb: Option<String>,
@@ -1539,6 +1677,7 @@ async fn connect(
         printer_driver_name,
         computer_name,
         use_display_control,
+        input_events_tx,
     }: ConnectParams,
 ) -> Result<(connector::ConnectionResult, WebSocket), IronError> {
     let mut framed = ironrdp_futures::LocalFuturesFramed::new(ws);
@@ -1546,6 +1685,7 @@ async fn connect(
     // In web browser environments, we do not have an easy access to the local address of the socket.
     let dummy_client_addr = core::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 33899));
 
+    let desktop_size = config.desktop_size;
     let mut connector = ClientConnector::new(config, dummy_client_addr);
 
     if let Some(clipboard_backend) = clipboard_backend {
@@ -1566,11 +1706,20 @@ async fn connect(
         );
     }
 
+    let graphics = GraphicsPipelineClient::new(
+        Box::new(WasmGraphicsPipelineHandler {
+            events: input_events_tx,
+            width: desktop_size.width,
+            height: desktop_size.height,
+            progressive: ProgressiveDecoder::new(),
+        }),
+        None,
+    );
+    let mut dynamic_channels = DrdynvcClient::new().with_dynamic_channel(graphics);
     if use_display_control {
-        connector.attach_static_channel(
-            DrdynvcClient::new().with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new()))),
-        );
+        dynamic_channels = dynamic_channels.with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
     }
+    connector.attach_static_channel(dynamic_channels);
 
     let (upgraded, server_public_key) =
         connect_rdcleanpath(&mut framed, &mut connector, destination.clone(), proxy_auth_token, pcb).await?;

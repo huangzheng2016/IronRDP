@@ -258,6 +258,13 @@ pub struct Config {
     /// [\[MS-RDPBCGR\] 2.2.1.3.7]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/861f2bbb-6ca2-4c5a-8c44-0714fa901e70
     /// [`MultiTransportChannelData`]: ironrdp_pdu::gcc::MultiTransportChannelData
     pub multitransport_flags: Option<gcc::MultiTransportFlags>,
+
+    /// Advertise client support for the Remote Desktop Protocol: Graphics Pipeline Extension.
+    ///
+    /// Enable this only after registering an EGFX-capable processor. Advertising the flag
+    /// without a processor can make a server route graphics to an unhandled channel.
+    /// The default is `false`, so EGFX is not advertised.
+    pub support_dyn_vc_gfx_protocol: bool,
 }
 
 ironrdp_core::assert_impl!(Config: Send, Sync);

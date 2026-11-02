@@ -809,6 +809,35 @@ impl DecodedImage {
         }
     }
 
+    pub fn apply_rgba32_bitmap(
+        &mut self,
+        rgba: &[u8],
+        update_rectangle: &InclusiveRectangle,
+    ) -> SessionResult<InclusiveRectangle> {
+        if !self.rect_fits(update_rectangle) {
+            debug!(
+                "Skipping rgba32 update {:?} outside image bounds {}x{}",
+                update_rectangle, self.width, self.height,
+            );
+            return Ok(InclusiveRectangle::empty());
+        }
+
+        let pointer_rendering_state = self.pointer_rendering_begin(update_rectangle)?;
+        let bytes_per_pixel = self.bytes_per_pixel();
+        let row_bytes = usize::from(update_rectangle.width()) * bytes_per_pixel;
+        let left = usize::from(update_rectangle.left) * bytes_per_pixel;
+        let top = usize::from(update_rectangle.top);
+        let stride = self.stride();
+        for row in 0..usize::from(update_rectangle.height()) {
+            let source_start = row * row_bytes;
+            let destination_start = (top + row) * stride + left;
+            self.data[destination_start..destination_start + row_bytes]
+                .copy_from_slice(&rgba[source_start..source_start + row_bytes]);
+        }
+
+        self.pointer_rendering_end(pointer_rendering_state)
+    }
+
     pub(crate) fn apply_rgb32_bitmap(
         &mut self,
         rgb32: &[u8],
@@ -878,5 +907,33 @@ impl DecodedImage {
         let update_rectangle = self.pointer_rendering_end(pointer_rendering_state)?;
 
         Ok(update_rectangle)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rgba32_bitmap_copies_a_region_with_nonzero_origin() {
+        let mut image = DecodedImage::new(PixelFormat::RgbA32, 128, 128);
+        let region = InclusiveRectangle {
+            left: 64,
+            top: 64,
+            right: 127,
+            bottom: 127,
+        };
+        let pixels = vec![0xab; 64 * 64 * 4];
+
+        let updated = image.apply_rgba32_bitmap(&pixels, &region).unwrap();
+
+        assert_eq!(updated, region);
+        let stride = image.stride();
+        let left = usize::from(region.left);
+        for row in 0..64 {
+            let start = (row + usize::from(region.top)) * stride + left * 4;
+            let end = start + 64 * 4;
+            assert_eq!(&image.data()[start..end], &pixels[..256]);
+        }
     }
 }
