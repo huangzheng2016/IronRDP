@@ -59,6 +59,7 @@ jobs:
       - name: Check the upstream base
         run: |
           set -euo pipefail
+          echo "RELEASE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
           git merge-base --is-ancestor "$UPSTREAM_BASE" HEAD
           test -f ".github/web-egfx-release-notes/${TAG}.md"
 
@@ -84,7 +85,7 @@ jobs:
         run: |
           set -euo pipefail
           export RUSTFLAGS="-Ctarget-feature=+simd128,+bulk-memory --cfg getrandom_backend=\"wasm_js\" --remap-path-prefix=${GITHUB_WORKSPACE}=/src --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=${RUSTUP_HOME:-$HOME/.rustup}=/rustup"
-          wasm-pack build --target web
+          wasm-pack build --target web -- --locked
 
           # Vite does not handle `new URL(url, import.meta.url)`, so import the module as an asset URL.
           file=pkg/ironrdp_web.js
@@ -159,7 +160,18 @@ jobs:
             echo "::error::release $TAG already exists"
             exit 1
           fi
-          gh release create "$TAG" --draft --verify-tag --latest=false \
+          gh release create "$TAG" --draft --verify-tag --target "$RELEASE_SHA" --latest=false \
             --title "$TAG" --notes-file RELEASE.md
           gh release upload "$TAG" ./*.tgz SHA256SUMS UPSTREAM.patch
+          # The tag must still point at the commit that was built.
+          current=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" --jq .object.sha)
+          type=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" --jq .object.type)
+          if [ "$type" = tag ]; then
+            current=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${current}" --jq .object.sha)
+          fi
+          if [ "$current" != "$RELEASE_SHA" ]; then
+            echo "::error::tag $TAG now points at $current, not the built commit $RELEASE_SHA"
+            gh release delete "$TAG" --yes
+            exit 1
+          fi
           gh release edit "$TAG" --draft=false

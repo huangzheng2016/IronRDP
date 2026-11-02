@@ -1184,9 +1184,10 @@ const MAX_DECODE_SURFACE_DIM: u16 = 16384;
 ///
 /// Each populated tile holds a [`TileState`] (about 36 KB) and a sub-band
 /// reference (about 24 KB). Without a bound a server can populate every tile of
-/// every surface it creates. 256 MiB holds roughly 4,400 tiles, which covers a
-/// 4K surface (about 2,040 tiles) with room for an offscreen surface.
-const MAX_RETAINED_BYTES: usize = 256 * 1024 * 1024;
+/// every surface it creates. 768 MiB holds roughly 13,000 tiles: a full 8K
+/// surface (7680x4320, 8,160 tiles) with room for an offscreen surface, or two
+/// 4K monitors with one more 4K surface. WebAssembly's 32-bit memory allows 4 GiB.
+const MAX_RETAINED_BYTES: usize = 768 * 1024 * 1024;
 
 /// Upper bound on the decoded RGBA tile bytes one [`ProgressiveDecoder::decode_bitmap`]
 /// call may return. One region can reference thousands of tiles and a payload can
@@ -2342,6 +2343,45 @@ mod tests {
         decoder.delete_surface(1);
         assert_eq!(decoder.surfaces.len(), 1);
         assert!(decoder.surfaces.contains_key(&2));
+    }
+
+    #[test]
+    fn default_retained_budget_covers_an_8k_surface() {
+        let tiles = usize::from(7680u16.div_ceil(64)) * usize::from(4320u16.div_ceil(64));
+        assert_eq!(tiles, 8160);
+
+        let mut count = 0;
+        let mut budget = DecodeBudget {
+            tile_count: &mut count,
+            max_retained_bytes: MAX_RETAINED_BYTES,
+            returned_bytes: 0,
+            max_returned_bytes: MAX_RETURNED_BYTES,
+        };
+        for populated in 0..tiles {
+            budget
+                .charge_tile(populated)
+                .unwrap_or_else(|_| panic!("tile {populated} of an 8K surface must fit"));
+        }
+        assert_eq!(count, tiles);
+    }
+
+    #[test]
+    fn default_retained_budget_still_refuses_beyond_its_cap() {
+        let per_tile = TILE_STATE_BYTES + REFERENCE_BYTES;
+        let capacity = MAX_RETAINED_BYTES / per_tile;
+
+        let mut count = 0;
+        let mut budget = DecodeBudget {
+            tile_count: &mut count,
+            max_retained_bytes: MAX_RETAINED_BYTES,
+            returned_bytes: 0,
+            max_returned_bytes: MAX_RETURNED_BYTES,
+        };
+        for populated in 0..capacity {
+            budget.charge_tile(populated).expect("tile within capacity");
+        }
+        assert!(budget.charge_tile(capacity).is_err());
+        assert_eq!(count, capacity);
     }
 
     #[test]

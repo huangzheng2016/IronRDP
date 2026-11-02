@@ -1,5 +1,6 @@
 mod autodetect;
 mod connection_activation;
+mod graphics_size;
 mod image;
 mod rfx;
 
