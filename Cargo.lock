@@ -2409,6 +2409,7 @@ dependencies = [
  "ironrdp-displaycontrol",
  "ironrdp-dvc",
  "ironrdp-echo",
+ "ironrdp-egfx",
  "ironrdp-graphics",
  "ironrdp-input",
  "ironrdp-pdu",
@@ -2636,6 +2637,7 @@ dependencies = [
 name = "ironrdp-egfx"
 version = "0.1.0"
 dependencies = [
+ "arbitrary",
  "bit_field",
  "bitflags 2.11.1",
  "ironrdp-core",
@@ -3025,7 +3027,6 @@ dependencies = [
  "ironrdp",
  "ironrdp-cliprdr-format",
  "ironrdp-core",
- "ironrdp-egfx",
  "ironrdp-futures",
  "ironrdp-pdu",
  "ironrdp-propertyset",

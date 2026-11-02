@@ -28,6 +28,10 @@ pub use ironrdp_core as core;
 #[doc(inline)]
 pub use ironrdp_displaycontrol as displaycontrol;
 
+#[cfg(feature = "egfx")]
+#[doc(inline)]
+pub use ironrdp_egfx as egfx;
+
 #[cfg(feature = "echo")]
 #[doc(inline)]
 pub use ironrdp_echo as echo;

@@ -22,8 +22,8 @@ use ironrdp::connector::credssp::KerberosConfig;
 use ironrdp::connector::{self, ClientConnector, Credentials};
 use ironrdp::displaycontrol::client::DisplayControlClient;
 use ironrdp::dvc::DrdynvcClient;
+use ironrdp::egfx::client::{BitmapUpdate, GraphicsPipelineClient, GraphicsPipelineHandler};
 use ironrdp::graphics::image_processing::PixelFormat;
-use ironrdp::graphics::progressive::ProgressiveDecoder;
 use ironrdp::pdu::geometry::InclusiveRectangle;
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp::pdu::rdp::capability_sets::client_codecs_capabilities;
@@ -34,8 +34,6 @@ use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd};
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStage, ActiveStageOutput, GracefulDisconnectReason, fast_path};
 use ironrdp_core::WriteBuf;
-use ironrdp_egfx::client::{BitmapUpdate, GraphicsPipelineClient, GraphicsPipelineHandler};
-use ironrdp_egfx::pdu::{CapabilitySet, WireToSurface2Pdu};
 use ironrdp_futures::{FramedWrite, single_sequence_step_read};
 use rgb::AsPixels as _;
 use tap::prelude::*;
@@ -519,9 +517,6 @@ pub(crate) type FastPathInputEvents = smallvec::SmallVec<[FastPathInputEvent; 2]
 
 struct WasmGraphicsPipelineHandler {
     events: mpsc::UnboundedSender<RdpInputEvent>,
-    width: u16,
-    height: u16,
-    progressive: ProgressiveDecoder,
 }
 
 impl WasmGraphicsPipelineHandler {
@@ -534,35 +529,10 @@ impl WasmGraphicsPipelineHandler {
             warn!("Graphics update received after the session event loop stopped");
         }
     }
-
-    fn emit_tile(&self, tile_x: u16, tile_y: u16, pixels: Vec<u8>) {
-        let left = tile_x.saturating_mul(64);
-        let top = tile_y.saturating_mul(64);
-        let right = left.saturating_add(64).min(self.width);
-        let bottom = top.saturating_add(64).min(self.height);
-        if right <= left || bottom <= top {
-            return;
-        }
-        let width = usize::from(right - left);
-        let height = usize::from(bottom - top);
-        let mut data = Vec::with_capacity(width * height * 4);
-        for row in pixels.chunks_exact(256).take(height) {
-            data.extend_from_slice(&row[..width * 4]);
-        }
-        self.emit(
-            InclusiveRectangle {
-                left,
-                top,
-                right: right - 1,
-                bottom: bottom - 1,
-            },
-            data,
-        );
-    }
 }
 
 impl GraphicsPipelineHandler for WasmGraphicsPipelineHandler {
-    fn on_capabilities_confirmed(&mut self, caps: &CapabilitySet) {
+    fn on_capabilities_confirmed(&mut self, caps: &ironrdp::egfx::pdu::CapabilitySet) {
         info!(?caps, "EGFX capabilities confirmed");
     }
 
@@ -572,9 +542,6 @@ impl GraphicsPipelineHandler for WasmGraphicsPipelineHandler {
             warn!(width, height, "EGFX graphics reset has unsupported dimensions");
             return;
         };
-        self.width = width;
-        self.height = height;
-        self.progressive = ProgressiveDecoder::new();
         if self
             .events
             .unbounded_send(RdpInputEvent::GraphicsReset { width, height })
@@ -589,12 +556,6 @@ impl GraphicsPipelineHandler for WasmGraphicsPipelineHandler {
         if update.data.is_empty() || rect.right <= rect.left || rect.bottom <= rect.top {
             return;
         }
-        info!(
-            width = update.width,
-            height = update.height,
-            bytes = update.data.len(),
-            "Uncompressed graphics update"
-        );
         self.emit(
             InclusiveRectangle {
                 left: rect.left,
@@ -604,26 +565,6 @@ impl GraphicsPipelineHandler for WasmGraphicsPipelineHandler {
             },
             update.data.clone(),
         );
-    }
-
-    fn on_wire_to_surface2(&mut self, pdu: &WireToSurface2Pdu) {
-        match self
-            .progressive
-            .decode_bitmap(pdu.codec_context_id, self.width, self.height, &pdu.bitmap_data)
-        {
-            Ok(tiles) => {
-                info!(
-                    width = self.width,
-                    height = self.height,
-                    tiles = tiles.len(),
-                    "Progressive graphics update decoded"
-                );
-                for tile in tiles {
-                    self.emit_tile(tile.x_idx, tile.y_idx, tile.pixels);
-                }
-            }
-            Err(error) => warn!(%error, "Progressive bitmap decode failed"),
-        }
     }
 }
 
@@ -1685,7 +1626,6 @@ async fn connect(
     // In web browser environments, we do not have an easy access to the local address of the socket.
     let dummy_client_addr = core::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 33899));
 
-    let desktop_size = config.desktop_size;
     let mut connector = ClientConnector::new(config, dummy_client_addr);
 
     if let Some(clipboard_backend) = clipboard_backend {
@@ -1709,9 +1649,6 @@ async fn connect(
     let graphics = GraphicsPipelineClient::new(
         Box::new(WasmGraphicsPipelineHandler {
             events: input_events_tx,
-            width: desktop_size.width,
-            height: desktop_size.height,
-            progressive: ProgressiveDecoder::new(),
         }),
         None,
     );
