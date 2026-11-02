@@ -1,5 +1,6 @@
 mod autodetect;
 mod connection_activation;
+mod image;
 mod rfx;
 
 #[cfg(test)]

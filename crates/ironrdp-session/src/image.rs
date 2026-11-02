@@ -822,6 +822,20 @@ impl DecodedImage {
             return Ok(InclusiveRectangle::empty());
         }
 
+        // The source buffer comes from the server and is indexed by rectangle size
+        // below, so a short buffer must be dropped rather than sliced out of range.
+        let expected_len = usize::from(update_rectangle.width())
+            .checked_mul(usize::from(update_rectangle.height()))
+            .and_then(|pixels| pixels.checked_mul(self.bytes_per_pixel()));
+        if expected_len.is_none_or(|len| rgba.len() < len) {
+            debug!(
+                "Skipping rgba32 update {:?} with a {} byte payload",
+                update_rectangle,
+                rgba.len(),
+            );
+            return Ok(InclusiveRectangle::empty());
+        }
+
         let pointer_rendering_state = self.pointer_rendering_begin(update_rectangle)?;
         let bytes_per_pixel = self.bytes_per_pixel();
         let row_bytes = usize::from(update_rectangle.width()) * bytes_per_pixel;
