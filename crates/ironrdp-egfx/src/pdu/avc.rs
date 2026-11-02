@@ -7,12 +7,28 @@ use ironrdp_pdu::{
     Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, cast_length, ensure_fixed_part_size,
     ensure_size, invalid_field_err,
 };
+use tracing::warn;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuantQuality {
     pub quantization_parameter: u8,
     pub progressive: bool,
     pub quality: u8,
+}
+
+// Manual `Arbitrary` impl: the encoder packs `quantization_parameter` into bits 0..6
+// via `set_bits`, which panics when the value exceeds 6 bits. Mask the field to its
+// wire-allowed range so fuzz inputs always round-trip through `Encode`. The other
+// fields use their full type range.
+#[cfg(feature = "arbitrary")]
+impl<'a> arbitrary::Arbitrary<'a> for QuantQuality {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        Ok(Self {
+            quantization_parameter: u.arbitrary::<u8>()? & 0x3F, // 6 bits
+            progressive: u.arbitrary()?,
+            quality: u.arbitrary()?,
+        })
+    }
 }
 
 impl QuantQuality {
@@ -58,6 +74,7 @@ impl<'de> Decode<'de> for QuantQuality {
     }
 }
 
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, PartialEq, Eq)]
 pub struct Avc420BitmapStream<'a> {
     pub rectangles: Vec<InclusiveRectangle>,
@@ -152,6 +169,19 @@ bitflags! {
     }
 }
 
+// Manual `Arbitrary` impl: the encoder packs `encoding.bits()` into 2 bits via
+// `set_bits(30..32, ...)` on the Avc444BitmapStream stream-info field. The bitflag
+// otherwise accepts any u8 value (via `const _ = !0`), so the bitflags-crate-provided
+// derive would generate values that exceed the 2-bit wire range and panic the encoder.
+// Mask to 2 bits.
+#[cfg(feature = "arbitrary")]
+impl<'a> arbitrary::Arbitrary<'a> for Encoding {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        Ok(Self::from_bits_retain(u.arbitrary::<u8>()? & 0x03))
+    }
+}
+
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Avc444BitmapStream<'a> {
     pub encoding: Encoding,
@@ -263,6 +293,7 @@ impl<'de> Decode<'de> for Avc444BitmapStream<'de> {
 /// assert_eq!(region.left, 0);
 /// assert_eq!(region.right, 1919);
 /// ```
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Avc420Region {
     /// Left edge of the region (inclusive)
@@ -331,6 +362,86 @@ impl Avc420Region {
             progressive: false,
             quality: self.quality,
         }
+    }
+}
+
+/// Convert H.264 AVC format to Annex B format
+///
+/// OpenH264 and similar decoders consume Annex B format (start code prefixed),
+/// but MS-RDPEGFX delivers AVC format (length-prefixed NAL units). This helper
+/// converts between the two by replacing each 4-byte big-endian length prefix
+/// with the 4-byte Annex B start code `[0x00, 0x00, 0x00, 0x01]`.
+///
+/// ```text
+/// AVC:     <4-byte BE length> <NAL> <4-byte BE length> <NAL> ...
+/// Annex B: 00 00 00 01 <NAL> 00 00 00 01 <NAL> ...
+/// ```
+///
+/// On malformed input (a NAL length extending past the buffer, or arithmetic
+/// overflow on `offset + nal_len`), the conversion stops at the last
+/// well-formed NAL unit and discards the remaining bytes.
+///
+/// # Arguments
+///
+/// * `data` - H.264 bitstream in AVC format
+///
+/// # Returns
+///
+/// H.264 bitstream in Annex B format with 4-byte start codes
+///
+/// # Example
+///
+/// ```
+/// use ironrdp_egfx::pdu::avc_to_annex_b;
+///
+/// // Length-prefixed NAL unit (length 3, payload [0x67, 0x42, 0x00])
+/// let avc = [0x00, 0x00, 0x00, 0x03, 0x67, 0x42, 0x00];
+/// let annex_b = avc_to_annex_b(&avc);
+/// assert_eq!(annex_b, [0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00]);
+/// ```
+#[must_use]
+pub fn avc_to_annex_b(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    avc_to_annex_b_into(data, &mut out);
+    out
+}
+
+/// In-place variant of [`avc_to_annex_b`] that writes the conversion result
+/// into a caller-provided buffer.
+///
+/// The caller's buffer is cleared before the conversion begins. This shape
+/// lets the caller reuse one allocation across many calls in a hot loop
+/// (for example a per-frame decoder pipeline) without per-call allocation.
+///
+/// See [`avc_to_annex_b`] for the conversion semantics.
+pub fn avc_to_annex_b_into(data: &[u8], out: &mut Vec<u8>) {
+    out.clear();
+    let mut offset = 0;
+
+    while offset + 4 <= data.len() {
+        let nal_len = u32::from_be_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
+
+        #[expect(clippy::as_conversions, reason = "NAL length from wire format")]
+        let nal_len = nal_len as usize;
+        offset += 4;
+
+        let Some(end) = offset.checked_add(nal_len) else {
+            warn!(nal_len, offset, "AVC NAL length overflow, discarding remaining data");
+            break;
+        };
+        if end > data.len() {
+            warn!(
+                nal_len,
+                offset,
+                data_len = data.len(),
+                "AVC NAL extends beyond buffer, discarding remaining data"
+            );
+            break;
+        }
+
+        out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        out.extend_from_slice(&data[offset..offset + nal_len]);
+        offset += nal_len;
     }
 }
 

@@ -29,12 +29,9 @@ use core::fmt;
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct DecodedFrame {
-    /// RGBA pixel data (4 bytes per pixel)
-    pub data: Vec<u8>,
-    /// Frame width in pixels
-    pub width: u32,
-    /// Frame height in pixels
-    pub height: u32,
+    data: Vec<u8>,
+    width: u32,
+    height: u32,
 }
 
 impl DecodedFrame {
@@ -49,6 +46,26 @@ impl DecodedFrame {
             "DecodedFrame buffer must be RGBA8888 (width * height * 4 bytes)",
         );
         Self { data, width, height }
+    }
+
+    /// RGBA pixel data (4 bytes per pixel).
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Frame width in pixels.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Frame height in pixels.
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Consume the frame and return the owned RGBA buffer.
+    pub fn into_data(self) -> Vec<u8> {
+        self.data
     }
 }
 
@@ -224,45 +241,11 @@ mod openh264_impl {
                 annex_b_buffer: Vec::new(),
             })
         }
-
-        /// Convert AVC format (4-byte BE length prefix) to Annex B (start codes)
-        fn avc_to_annex_b(&mut self, data: &[u8]) {
-            self.annex_b_buffer.clear();
-            let mut offset = 0;
-
-            while offset + 4 <= data.len() {
-                let nal_len = u32::from_be_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
-
-                #[expect(clippy::as_conversions, reason = "NAL length from wire format")]
-                let nal_len = nal_len as usize;
-                offset += 4;
-
-                // Use checked addition to prevent overflow on malicious input
-                let Some(end) = offset.checked_add(nal_len) else {
-                    warn!(nal_len, offset, "AVC NAL length overflow, discarding remaining data");
-                    break;
-                };
-                if end > data.len() {
-                    warn!(
-                        nal_len,
-                        offset,
-                        data_len = data.len(),
-                        "AVC NAL extends beyond buffer, discarding remaining data"
-                    );
-                    break;
-                }
-
-                // Annex B start code
-                self.annex_b_buffer.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-                self.annex_b_buffer.extend_from_slice(&data[offset..offset + nal_len]);
-                offset += nal_len;
-            }
-        }
     }
 
     impl H264Decoder for OpenH264Decoder {
         fn decode(&mut self, data: &[u8]) -> DecoderResult<DecodedFrame> {
-            self.avc_to_annex_b(data);
+            crate::pdu::avc_to_annex_b_into(data, &mut self.annex_b_buffer);
 
             let yuv = self
                 .decoder
@@ -286,11 +269,7 @@ mod openh264_impl {
             let mut rgba = vec![0u8; rgba_size];
             yuv.write_rgba8(&mut rgba);
 
-            Ok(DecodedFrame {
-                data: rgba,
-                width: w32,
-                height: h32,
-            })
+            Ok(DecodedFrame::new(rgba, w32, h32))
         }
 
         fn reset(&mut self) {
@@ -309,3 +288,24 @@ mod openh264_impl {
 
 #[cfg(feature = "openh264")]
 pub use openh264_impl::OpenH264Decoder;
+
+#[cfg(test)]
+mod tests {
+    use super::DecodedFrame;
+
+    #[test]
+    fn getters_return_constructor_inputs() {
+        let data = vec![0u8; 2 * 3 * 4];
+        let frame = DecodedFrame::new(data.clone(), 2, 3);
+        assert_eq!(frame.data(), data.as_slice());
+        assert_eq!(frame.width(), 2);
+        assert_eq!(frame.height(), 3);
+    }
+
+    #[test]
+    fn into_data_yields_owned_buffer() {
+        let data = vec![0xAAu8; 4 * 4 * 4];
+        let frame = DecodedFrame::new(data.clone(), 4, 4);
+        assert_eq!(frame.into_data(), data);
+    }
+}

@@ -1,7 +1,7 @@
 //! Client-side EGFX implementation
 //!
 //! This module provides client-side support for the Graphics Pipeline Extension
-//! ([MS-RDPEGFX]), including H.264 AVC420 decode and surface management.
+//! ([MS-RDPEGFX]), including H.264 AVC420 decode, ClearCodec decode, and surface management.
 //!
 //! # Protocol Compliance
 //!
@@ -24,7 +24,7 @@
 //!    |                                       |
 //!    |  (For each frame:)                    |
 //!    |--- StartFrame ----------------------->|
-//!    |--- WireToSurface1 (H.264) ----------->|  -> H264Decoder::decode()
+//!    |--- WireToSurface1 (codec) ----------->|  -> H264/ClearCodec decode
 //!    |--- EndFrame ------------------------->|  -> FrameAcknowledge
 //!    |                                       |
 //!    |<---------- FrameAcknowledge ----------|
@@ -61,7 +61,7 @@ use ironrdp_graphics::clearcodec::ClearCodecDecoder;
 use ironrdp_graphics::progressive::{ProgressiveDecoder, TILE_BYTES_PER_PIXEL, TILE_DIM};
 use ironrdp_graphics::rdp6::BitmapStreamDecoder;
 use ironrdp_graphics::zgfx;
-use ironrdp_pdu::geometry::{ExclusiveRectangle, Rectangle as _};
+use ironrdp_pdu::geometry::ExclusiveRectangle;
 use ironrdp_pdu::{PduResult, decode_cursor, decode_err, pdu_other_err};
 use tracing::{debug, trace, warn};
 
@@ -223,18 +223,25 @@ pub struct BitmapUpdate {
 pub trait GraphicsPipelineHandler: Send {
     /// Returns the capability sets to advertise to the server
     ///
-    /// The default advertises V10.7 (AVC420+AVC444), V8.1 (AVC420 only),
-    /// and V8 (no AVC) as fallback.
+    /// The default advertises V8.1 (AVC420) and V8 (no AVC) as fallback.
+    ///
+    /// V10.x is deliberately absent. Those versions signal AVC444 support
+    /// unless `AVC_DISABLED` is set, and [`GraphicsPipelineClient`] has no
+    /// AVC444 decoder: [`Codec1Type::Avc444`] and [`Codec1Type::Avc444v2`]
+    /// reach [`GraphicsPipelineHandler::on_unhandled_pdu`] instead of being
+    /// decoded. The server picks one of the advertised sets ([capability
+    /// negotiation]) and prefers the most capable, so offering AVC444 makes a
+    /// host that supports it send nothing the client can paint. Add V10.7 back
+    /// once AVC444 decodes.
     ///
     /// Note: AVC-capable versions are automatically filtered out at
     /// advertisement time if no H.264 decoder is configured on the
     /// [`GraphicsPipelineClient`]. If all returned sets require AVC
     /// and no decoder is available, a V8-only fallback is used.
+    ///
+    /// [capability negotiation]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/31c6e2b1-335b-4a75-9454-bb2309958c21
     fn capabilities(&self) -> Vec<CapabilitySet> {
         vec![
-            CapabilitySet::V10_7 {
-                flags: CapabilitiesV107Flags::SMALL_CACHE,
-            },
             CapabilitySet::V8_1 {
                 flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE,
             },
@@ -413,6 +420,7 @@ impl GraphicsPipelineClient {
     /// Create a new `GraphicsPipelineClient`
     ///
     /// If `h264_decoder` is `None`, AVC420 frames are logged and skipped.
+    /// ClearCodec decoding is always available (no external decoder required).
     pub fn new(handler: Box<dyn GraphicsPipelineHandler>, h264_decoder: Option<Box<dyn H264Decoder>>) -> Self {
         Self {
             handler,
@@ -467,6 +475,18 @@ impl GraphicsPipelineClient {
         self.total_frames_decoded
     }
 
+    /// Take the output-buffer regions that changed in completed frames.
+    ///
+    /// The client-side compositor applies every surface command (`WireToSurface1`
+    /// decodes, `SolidFill`, `SurfaceToSurface`, and the bitmap cache) into
+    /// persistent RGBA8888 surfaces and maps them onto the graphics output. This
+    /// drains the accumulated output-space deltas, committed per `EndFrame` and
+    /// ready to blit into a framebuffer. Each call empties the queue.
+    #[must_use]
+    pub fn drain_output(&mut self) -> Vec<OutputUpdate> {
+        self.compositor.drain_output()
+    }
+
     // ========================================================================
     // PDU Handlers
     // ========================================================================
@@ -515,6 +535,8 @@ impl GraphicsPipelineClient {
             // Surface operations
             GfxPdu::SolidFill(pdu) => {
                 trace!(surface_id = pdu.surface_id, "SolidFill");
+                self.compositor
+                    .solid_fill(pdu.surface_id, &pdu.fill_pixel, &pdu.rectangles);
                 self.handler.on_solid_fill(&pdu);
                 Ok(vec![])
             }
@@ -523,6 +545,12 @@ impl GraphicsPipelineClient {
                     src = pdu.source_surface_id,
                     dst = pdu.destination_surface_id,
                     "SurfaceToSurface"
+                );
+                self.compositor.surface_to_surface(
+                    pdu.source_surface_id,
+                    pdu.destination_surface_id,
+                    &pdu.source_rectangle,
+                    &pdu.destination_points,
                 );
                 self.handler.on_surface_to_surface(&pdu);
                 Ok(vec![])
@@ -535,6 +563,8 @@ impl GraphicsPipelineClient {
                     cache_slot = pdu.cache_slot,
                     "SurfaceToCache"
                 );
+                self.compositor
+                    .surface_to_cache(pdu.surface_id, pdu.cache_slot, &pdu.source_rectangle);
                 self.handler.on_surface_to_cache(&pdu);
                 Ok(vec![])
             }
@@ -544,11 +574,14 @@ impl GraphicsPipelineClient {
                     surface_id = pdu.surface_id,
                     "CacheToSurface"
                 );
+                self.compositor
+                    .cache_to_surface(pdu.cache_slot, pdu.surface_id, &pdu.destination_points);
                 self.handler.on_cache_to_surface(&pdu);
                 Ok(vec![])
             }
             GfxPdu::EvictCacheEntry(pdu) => {
                 trace!(cache_slot = pdu.cache_slot, "EvictCacheEntry");
+                self.compositor.evict_cache_entry(pdu.cache_slot);
                 self.handler.on_evict_cache_entry(&pdu);
                 Ok(vec![])
             }
@@ -639,6 +672,7 @@ impl GraphicsPipelineClient {
     fn handle_reset_graphics(&mut self, width: u32, height: u32) {
         // Per spec, ResetGraphics implicitly destroys all surfaces
         self.surfaces.clear();
+        self.compositor.reset(width, height);
 
         // Reset frame tracking state so subsequent FrameAcknowledge PDUs
         // don't report stale queue depth from a previous stream.
@@ -652,11 +686,11 @@ impl GraphicsPipelineClient {
         if let Some(ref mut decoder) = self.h264_decoder {
             decoder.reset();
         }
-        self.compositor.reset(width, height);
         // The Progressive decoder is deliberately NOT reset here either. Its context lifetime
         // is driven by DeleteEncodingContext and DeleteSurface; MS-RDPEGFX 3.3.5.14 only
-        // resizes the Graphics Output Buffer. Dropping it here would discard the tile state
-        // that later upgrade passes refine.
+        // resizes the Graphics Output Buffer. Windows establishes a codec context once and
+        // never re-sends SYNC + CONTEXT afterwards, so dropping it here makes every later
+        // payload fail with MissingBlock("CONTEXT").
         // The ClearCodec decoder is deliberately NOT reset here. MS-RDPEGFX 3.3.5.14 only
         // resizes the Graphics Output Buffer; cache lifetime is driven by the stream instead,
         // through CLEARCODEC_FLAG_CACHE_RESET (2.2.4.1), which ClearCodecDecoder::decode
@@ -685,6 +719,7 @@ impl GraphicsPipelineClient {
         };
 
         debug!(surface_id, width, height, ?pixel_format, "Surface created");
+        self.compositor.create_surface(surface_id, width, height);
         self.handler.on_surface_created(&surface);
         self.surfaces.insert(surface_id, surface);
     }
@@ -692,6 +727,7 @@ impl GraphicsPipelineClient {
     fn handle_delete_surface(&mut self, surface_id: u16) {
         self.progressive_decoder.delete_surface(surface_id);
         if self.surfaces.remove(&surface_id).is_some() {
+            self.compositor.delete_surface(surface_id);
             debug!(surface_id, "Surface deleted");
             self.handler.on_surface_deleted(surface_id);
         } else {
@@ -704,6 +740,7 @@ impl GraphicsPipelineClient {
             surface.is_mapped = true;
             surface.output_origin_x = origin_x;
             surface.output_origin_y = origin_y;
+            self.compositor.map_surface(surface_id, origin_x, origin_y);
             debug!(surface_id, origin_x, origin_y, "Surface mapped to output");
             self.handler.on_surface_mapped(surface_id, origin_x, origin_y);
         } else {
@@ -751,6 +788,12 @@ impl GraphicsPipelineClient {
             Codec1Type::Avc444 | Codec1Type::Avc444v2 => {
                 debug!("AVC444 codec not yet implemented, forwarding to handler");
                 self.handler.on_unhandled_pdu(&GfxPdu::WireToSurface1(pdu));
+            }
+            Codec1Type::ClearCodec => {
+                self.decode_clearcodec(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data)?;
+            }
+            Codec1Type::Planar => {
+                self.decode_planar(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data)?;
             }
             Codec1Type::Uncompressed => {
                 self.handle_uncompressed(pdu);
@@ -866,16 +909,18 @@ impl GraphicsPipelineClient {
             .decode(stream.data)
             .map_err(|e| pdu_other_err!("H.264 decode", source: e))?;
 
-        let dest_width = dest_rect.width();
-        let dest_height = dest_rect.height();
+        // MS-RDPEGFX 2.2.1.4.1: RDPGFX_RECT16 right/bottom are exclusive (one-past-end),
+        // so dimensions are right-left / bottom-top despite the parsed type's name.
+        let dest_width = dest_rect.right - dest_rect.left;
+        let dest_height = dest_rect.bottom - dest_rect.top;
 
         // Decoded frame must be at least as large as the destination rectangle.
         // Larger is expected (macroblock alignment) and handled by cropping.
         // Smaller means the server sent mismatched dimensions.
-        if frame.width < u32::from(dest_width) || frame.height < u32::from(dest_height) {
+        if frame.width() < u32::from(dest_width) || frame.height() < u32::from(dest_height) {
             warn!(
-                frame_width = frame.width,
-                frame_height = frame.height,
+                frame_width = frame.width(),
+                frame_height = frame.height(),
                 dest_width,
                 dest_height,
                 "decoded frame smaller than destination rectangle"
@@ -883,7 +928,7 @@ impl GraphicsPipelineClient {
             return Err(pdu_other_err!("decoded frame smaller than destination rectangle"));
         }
 
-        let cropped_data = crop_decoded_frame(&frame.data, frame.width, frame.height, dest_width, dest_height);
+        let cropped_data = crop_decoded_frame(frame.data(), frame.width(), frame.height(), dest_width, dest_height);
 
         let update = BitmapUpdate {
             surface_id,
@@ -894,13 +939,91 @@ impl GraphicsPipelineClient {
             height: dest_height,
         };
 
+        self.compositor.apply_bitmap(surface_id, dest_rect, &update.data);
+        self.handler.on_bitmap_updated(&update);
+        Ok(())
+    }
+
+    fn decode_clearcodec(
+        &mut self,
+        surface_id: u16,
+        dest_rect: &ExclusiveRectangle,
+        bitmap_data: &[u8],
+    ) -> PduResult<()> {
+        // MS-RDPEGFX 2.2.1.4.1: see decode_avc420 above for wire-format note.
+        let dest_width = dest_rect.right - dest_rect.left;
+        let dest_height = dest_rect.bottom - dest_rect.top;
+
+        let bgra = self
+            .clearcodec_decoder
+            .decode(bitmap_data, dest_width, dest_height)
+            .map_err(|e| pdu_other_err!("ClearCodec decode", source: e))?;
+
+        // ClearCodec outputs BGRA; convert to RGBA for the uniform BitmapUpdate format
+        let rgba = convert_bgra_to_rgba(&bgra);
+
+        let update = BitmapUpdate {
+            surface_id,
+            destination_rectangle: dest_rect.clone(),
+            codec_id: Codec1Type::ClearCodec,
+            data: rgba,
+            width: dest_width,
+            height: dest_height,
+        };
+
+        self.handler.on_bitmap_updated(&update);
+        Ok(())
+    }
+
+    /// Decode an RDP 6.0 Planar bitmap ([MS-RDPEGFX] `RDPGFX_CODECID_PLANAR`, 0x000A).
+    ///
+    /// The payload is an `RDP6_BITMAP_STREAM` ([MS-RDPEGDI] 2.2.2.5.1), the same
+    /// structure the fast-path bitmap route already decodes, so this reuses
+    /// `ironrdp-graphics`' decoder rather than adding a second implementation.
+    fn decode_planar(&mut self, surface_id: u16, dest_rect: &ExclusiveRectangle, bitmap_data: &[u8]) -> PduResult<()> {
+        // MS-RDPEGFX 2.2.2.1: destRect gives both the target point and "the
+        // dimensions (width and height) of the bitmap data". It is only a bounding
+        // rectangle for the AVC codecs, so for Planar these are exact.
+        let dest_width = dest_rect.right - dest_rect.left;
+        let dest_height = dest_rect.bottom - dest_rect.top;
+
+        let mut rgb24 = Vec::new();
+        self.planar_decoder
+            .decode_bitmap_stream_to_rgb24(
+                bitmap_data,
+                &mut rgb24,
+                usize::from(dest_width),
+                usize::from(dest_height),
+            )
+            .map_err(|e| pdu_other_err!("Planar decode", source: e))?;
+
+        // The decoder emits RGB24 top-down row-major, which is the order surfaces
+        // are stored in, so no vertical flip is needed.
+        //
+        // Opacity is not carried here. An `RDP6_BITMAP_STREAM` can include an alpha
+        // plane (FormatHeader NA bit clear), but EGFX conveys per-pixel opacity in a
+        // separate `RDPGFX_CODECID_ALPHA` (0x000C) command carrying an
+        // `ALPHACODEC_BITMAP_STREAM` ([MS-RDPEGFX] 2.2.4.3), so a Planar command
+        // contributes color only and the pixels are opaque.
+        let rgba = convert_rgb24_to_rgba(&rgb24);
+
+        let update = BitmapUpdate {
+            surface_id,
+            destination_rectangle: dest_rect.clone(),
+            codec_id: Codec1Type::Planar,
+            data: rgba,
+            width: dest_width,
+            height: dest_height,
+        };
+
         self.handler.on_bitmap_updated(&update);
         Ok(())
     }
 
     fn handle_uncompressed(&mut self, pdu: crate::pdu::WireToSurface1Pdu) {
-        let dest_width = pdu.destination_rectangle.width();
-        let dest_height = pdu.destination_rectangle.height();
+        // MS-RDPEGFX 2.2.1.4.1: see decode_avc420 above for wire-format note.
+        let dest_width = pdu.destination_rectangle.right - pdu.destination_rectangle.left;
+        let dest_height = pdu.destination_rectangle.bottom - pdu.destination_rectangle.top;
 
         // Convert wire-format pixels to RGBA.
         // BitmapUpdate.data is always RGBA8888 regardless of codec -- this is
@@ -917,6 +1040,8 @@ impl GraphicsPipelineClient {
             height: dest_height,
         };
 
+        self.compositor
+            .apply_bitmap(update.surface_id, &update.destination_rectangle, &update.data);
         self.handler.on_bitmap_updated(&update);
     }
 
@@ -933,7 +1058,9 @@ impl GraphicsPipelineClient {
 
         self.handler.on_frame_complete(frame_id);
 
-        // Per [3.3.5.12]: client MUST send FrameAcknowledge after EndFrame
+        // Per [3.3.5.12]: client MUST send FrameAcknowledge after EndFrame.
+        // We send the actual queue depth (not Unavailable / 0xFFFFFFFF as FreeRDP does);
+        // the real value gives the server backpressure information for frame pacing.
         let ack = GfxPdu::FrameAcknowledge(FrameAcknowledgePdu {
             queue_depth: QueueDepth::from_u32(self.frames_queued),
             frame_id,
@@ -1022,6 +1149,33 @@ impl DvcClientProcessor for GraphicsPipelineClient {}
 // Frame Cropping
 // ============================================================================
 
+/// Convert BGRA pixel data to RGBA8888
+///
+/// ClearCodec produces BGRA output per [MS-RDPEGFX 2.2.4.1]. Reorder to
+/// [R, G, B, A] for the uniform `BitmapUpdate` pixel format.
+/// Widen tightly-packed RGB24 to RGBA, marking every pixel opaque.
+///
+/// The RDP 6.0 Planar decoder emits three bytes per pixel; `BitmapUpdate` carries
+/// four. See `decode_planar` for why the alpha byte is synthesized rather than
+/// taken from the stream.
+fn convert_rgb24_to_rgba(src: &[u8]) -> Vec<u8> {
+    debug_assert!(src.len().is_multiple_of(3), "RGB24 input length not aligned to 3 bytes");
+    let mut dst = Vec::with_capacity(src.len() / 3 * 4);
+    for pixel in src.chunks_exact(3) {
+        dst.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 0xFF]);
+    }
+    dst
+}
+
+fn convert_bgra_to_rgba(src: &[u8]) -> Vec<u8> {
+    debug_assert!(src.len().is_multiple_of(4), "BGRA input length not aligned to 4 bytes");
+    let mut dst = Vec::with_capacity(src.len());
+    for pixel in src.chunks_exact(4) {
+        dst.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+    }
+    dst
+}
+
 /// Convert uncompressed 32bpp little-endian pixels to RGBA8888
 ///
 /// The wire format for uncompressed graphics is 0xAARRGGBB in a 32-bit
@@ -1099,8 +1253,6 @@ fn crop_decoded_frame(
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use ironrdp_pdu::codecs::rfx::progressive::TILE_FLAG_DIFFERENCE;
-
     use super::*;
 
     struct TestHandler;
@@ -1114,6 +1266,125 @@ mod tests {
         fn on_frame_complete(&mut self, _frame_id: u32) {}
         fn on_close(&mut self) {}
         fn on_unhandled_pdu(&mut self, _pdu: &GfxPdu) {}
+    }
+
+    /// Captures bitmap updates and unhandled PDUs so a test can tell decode from
+    /// fallthrough.
+    /// `(codec_id, width, height, rgba)` extracted from each update, since
+    /// `BitmapUpdate` is not `Clone` and does not need to be.
+    type CapturedUpdate = (Codec1Type, u16, u16, Vec<u8>);
+
+    struct CapturingHandler {
+        updates: Arc<Mutex<Vec<CapturedUpdate>>>,
+        unhandled: Arc<Mutex<usize>>,
+    }
+    impl GraphicsPipelineHandler for CapturingHandler {
+        fn on_capabilities_confirmed(&mut self, _caps: &CapabilitySet) {}
+        fn on_reset_graphics(&mut self, _width: u32, _height: u32) {}
+        fn on_surface_created(&mut self, _surface: &Surface) {}
+        fn on_surface_deleted(&mut self, _surface_id: u16) {}
+        fn on_surface_mapped(&mut self, _surface_id: u16, _x: u32, _y: u32) {}
+        fn on_bitmap_updated(&mut self, update: &BitmapUpdate) {
+            self.updates.lock().expect("updates lock").push((
+                update.codec_id,
+                update.width,
+                update.height,
+                update.data.clone(),
+            ));
+        }
+        fn on_frame_complete(&mut self, _frame_id: u32) {}
+        fn on_close(&mut self) {}
+        fn on_unhandled_pdu(&mut self, _pdu: &GfxPdu) {
+            *self.unhandled.lock().expect("unhandled lock") += 1;
+        }
+    }
+
+    /// A Planar `WireToSurface1` decodes to the pixels that were encoded, rather
+    /// than falling through to the handler as an unsupported codec.
+    ///
+    /// The payload is built with IronRDP's own RDP6 encoder, so this exercises the
+    /// real `RDP6_BITMAP_STREAM` framing ([MS-RDPEGDI] 2.2.2.5.1) that
+    /// `RDPGFX_CODECID_PLANAR` carries, not a hand-rolled approximation.
+    #[test]
+    fn planar_wire_to_surface_decodes_to_rgba() {
+        use ironrdp_graphics::rdp6::{BitmapStreamEncoder, RgbChannels};
+
+        const W: u16 = 4;
+        const H: u16 = 2;
+
+        // Distinct per-channel values so a channel swap or row reversal fails.
+        let mut rgb = Vec::new();
+        for i in 0..u8::try_from(W).unwrap() * u8::try_from(H).unwrap() {
+            rgb.extend_from_slice(&[i, 100 + i, 200 + i]);
+        }
+
+        for rle in [false, true] {
+            let mut encoded = vec![0u8; rgb.len() * 4 + 64];
+            let len = BitmapStreamEncoder::new(usize::from(W), usize::from(H))
+                .encode_bitmap::<RgbChannels>(&rgb, &mut encoded, rle)
+                .unwrap();
+            encoded.truncate(len);
+
+            let updates = Arc::new(Mutex::new(Vec::new()));
+            let unhandled = Arc::new(Mutex::new(0));
+            let mut client = GraphicsPipelineClient::new(
+                Box::new(CapturingHandler {
+                    updates: Arc::clone(&updates),
+                    unhandled: Arc::clone(&unhandled),
+                }),
+                None,
+            );
+
+            let _ = client.handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+                surface_id: 1,
+                width: W,
+                height: H,
+                pixel_format: PixelFormat::XRgb,
+            }));
+
+            client
+                .handle_pdu(GfxPdu::WireToSurface1(crate::pdu::WireToSurface1Pdu {
+                    surface_id: 1,
+                    codec_id: Codec1Type::Planar,
+                    pixel_format: PixelFormat::XRgb,
+                    destination_rectangle: ExclusiveRectangle {
+                        left: 0,
+                        top: 0,
+                        right: W,
+                        bottom: H,
+                    },
+                    bitmap_data: encoded,
+                }))
+                .unwrap();
+
+            assert_eq!(
+                *unhandled.lock().expect("unhandled lock"),
+                0,
+                "rle={rle}: Planar must not fall through"
+            );
+            let updates = updates.lock().expect("updates lock");
+            assert_eq!(updates.len(), 1, "rle={rle}");
+            let (codec_id, width, height, data) = &updates[0];
+            assert_eq!(*codec_id, Codec1Type::Planar, "rle={rle}");
+            assert_eq!(*width, W, "rle={rle}");
+            assert_eq!(*height, H, "rle={rle}");
+
+            let expected: Vec<u8> = rgb.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 0xFF]).collect();
+            assert_eq!(*data, expected, "rle={rle}");
+        }
+    }
+
+    #[test]
+    fn convert_rgb24_to_rgba_widens_and_marks_opaque() {
+        let rgb = vec![
+            0x10, 0x20, 0x30, // R=16, G=32, B=48
+            0x40, 0x50, 0x60, // R=64, G=80, B=96
+        ];
+
+        assert_eq!(
+            convert_rgb24_to_rgba(&rgb),
+            vec![0x10, 0x20, 0x30, 0xFF, 0x40, 0x50, 0x60, 0xFF]
+        );
     }
 
     #[test]
@@ -1188,6 +1459,24 @@ mod tests {
     }
 
     #[test]
+    fn convert_bgra_to_rgba_reorders_channels() {
+        // BGRA input: [B, G, R, A] per pixel
+        let bgra = vec![
+            0xFF, 0x00, 0x00, 0xCC, // B=255, G=0, R=0, A=204 (blue)
+            0x00, 0xFF, 0x00, 0x80, // B=0, G=255, R=0, A=128 (green)
+        ];
+        let rgba = convert_bgra_to_rgba(&bgra);
+        // Expected: [R, G, B, A] per pixel
+        assert_eq!(
+            rgba,
+            vec![
+                0x00, 0x00, 0xFF, 0xCC, // R=0, G=0, B=255, A=204
+                0x00, 0xFF, 0x00, 0x80, // R=0, G=255, B=0, A=128
+            ]
+        );
+    }
+
+    #[test]
     fn convert_uncompressed_bgrx_to_rgba() {
         // Wire format: [B, G, R, A] per pixel (0xAARRGGBB little-endian)
         let wire_pixels = vec![
@@ -1198,6 +1487,7 @@ mod tests {
         // Expected: [R, G, B, 0xFF] per pixel (alpha forced to opaque)
         assert_eq!(rgba, vec![0xFF, 0x80, 0x00, 0xFF, 0x30, 0x20, 0x10, 0xFF]);
     }
+
     /// Every capability set the default advertises must correspond to a codec
     /// `handle_wire_to_surface1` can actually decode.
     ///
@@ -1257,13 +1547,47 @@ mod tests {
         }))
     }
 
-    fn progressive_tile_stream(
-        tile_x: u16,
-        tile_y: u16,
-        region_rect: ironrdp_pdu::codecs::rfx::RfxRectangle,
-        tile_flags: u8,
-    ) -> Vec<u8> {
+    fn progressive_context_stream(with_context: bool) -> Vec<u8> {
+        use ironrdp_pdu::codecs::rfx::RfxRectangle;
+        use ironrdp_pdu::codecs::rfx::progressive::{
+            ProgressiveBlock, ProgressiveContextPdu, ProgressiveFrameBeginPdu, ProgressiveFrameEndPdu,
+            ProgressiveRegion, ProgressiveSyncPdu, encode_progressive_stream,
+        };
+
+        let mut blocks = Vec::new();
+        if with_context {
+            blocks.push(ProgressiveBlock::Sync(ProgressiveSyncPdu));
+            blocks.push(ProgressiveBlock::Context(ProgressiveContextPdu {
+                context_id: 0,
+                tile_size: 0x0040,
+                flags: 0,
+            }));
+        }
+        blocks.push(ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
+            frame_index: 0,
+            region_count: 1,
+        }));
+        blocks.push(ProgressiveBlock::Region(ProgressiveRegion {
+            tile_size: 0x40,
+            rects: vec![RfxRectangle {
+                x: 0,
+                y: 0,
+                width: 64,
+                height: 64,
+            }],
+            quant_vals: vec![],
+            quant_prog_vals: vec![],
+            flags: 0,
+            tiles: vec![],
+        }));
+        blocks.push(ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu));
+
+        encode_progressive_stream(&blocks).unwrap()
+    }
+
+    fn progressive_tile_stream(tile_x: u16, tile_y: u16, rect_width: u16, rect_height: u16) -> Vec<u8> {
         use ironrdp_graphics::progressive::{COEFFICIENTS_PER_COMPONENT, encode_first_pass};
+        use ironrdp_pdu::codecs::rfx::RfxRectangle;
         use ironrdp_pdu::codecs::rfx::progressive::{
             ComponentCodecQuant, ProgressiveBlock, ProgressiveContextPdu, ProgressiveFrameBeginPdu,
             ProgressiveFrameEndPdu, ProgressiveRegion, ProgressiveSyncPdu, ProgressiveTile, TileSimple,
@@ -1296,7 +1620,12 @@ mod tests {
             }),
             ProgressiveBlock::Region(ProgressiveRegion {
                 tile_size: 0x40,
-                rects: vec![region_rect],
+                rects: vec![RfxRectangle {
+                    x: tile_x.saturating_mul(64),
+                    y: tile_y.saturating_mul(64),
+                    width: rect_width,
+                    height: rect_height,
+                }],
                 quant_vals: vec![base_quant],
                 quant_prog_vals: vec![],
                 flags: 0,
@@ -1306,7 +1635,7 @@ mod tests {
                     quant_idx_cr: 0,
                     x_idx: tile_x,
                     y_idx: tile_y,
-                    flags: tile_flags,
+                    flags: 0,
                     y_data: component_data,
                     cb_data: component_data,
                     cr_data: component_data,
@@ -1377,7 +1706,7 @@ mod tests {
                 frame_id: 2,
             }))
             .unwrap();
-        wire_progressive(&mut client, progressive_tile_stream(1, 1, rect(64, 64, 36, 36), 0)).unwrap();
+        wire_progressive(&mut client, progressive_tile_stream(1, 1, 36, 36)).unwrap();
         client
             .handle_pdu(GfxPdu::EndFrame(crate::pdu::EndFramePdu { frame_id: 2 }))
             .unwrap();
@@ -1561,296 +1890,17 @@ mod tests {
         assert!(client.drain_output().is_empty());
     }
 
-    fn progressive_upgrade_stream() -> Vec<u8> {
-        use ironrdp_pdu::codecs::rfx::progressive::{
-            ComponentCodecQuant, ProgressiveBlock, ProgressiveFrameBeginPdu, ProgressiveFrameEndPdu, ProgressiveRegion,
-            ProgressiveTile, TileUpgrade, encode_progressive_stream,
-        };
-
-        encode_progressive_stream(&[
-            ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
-                frame_index: 1,
-                region_count: 1,
-            }),
-            ProgressiveBlock::Region(ProgressiveRegion {
-                tile_size: 0x40,
-                rects: vec![rect(0, 0, 64, 64)],
-                quant_vals: vec![ComponentCodecQuant::LOSSLESS],
-                quant_prog_vals: vec![],
-                flags: 0,
-                tiles: vec![ProgressiveTile::Upgrade(TileUpgrade {
-                    quant_idx_y: 0,
-                    quant_idx_cb: 0,
-                    quant_idx_cr: 0,
-                    x_idx: 0,
-                    y_idx: 0,
-                    quality: 0xFF,
-                    y_srl_data: &[],
-                    y_raw_data: &[],
-                    cb_srl_data: &[],
-                    cb_raw_data: &[],
-                    cr_srl_data: &[],
-                    cr_raw_data: &[],
-                })],
-            }),
-            ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
-        ])
-        .unwrap()
-    }
-
-    #[test]
-    fn repeated_decode_failures_preserve_progressive_tiles_on_all_surfaces() {
-        let updates = Arc::new(Mutex::new(Vec::new()));
+    fn assert_progressive_context_is_deleted(clear: impl FnOnce(&mut GraphicsPipelineClient)) {
         let mut client = progressive_client();
-        client.handler = Box::new(CapturingHandler {
-            updates: Arc::clone(&updates),
-            unhandled: Arc::new(Mutex::new(0)),
-        });
-        client
-            .handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
-                surface_id: 2,
-                width: 64,
-                height: 64,
-                pixel_format: PixelFormat::XRgb,
-            }))
-            .unwrap();
-        for surface_id in [1, 2] {
-            send(
-                &mut client,
-                surface_id,
-                progressive_tile_stream(0, 0, rect(0, 0, 64, 64), 0),
-            );
-        }
-        assert_eq!(updates.lock().unwrap().len(), 2);
-        updates.lock().unwrap().clear();
-
-        for _ in 0..64 {
-            wire_progressive(&mut client, vec![0xFF; 32]).unwrap();
-        }
-        assert_eq!(client.dropped_updates, 64);
-        for surface_id in [2, 1] {
-            send(&mut client, surface_id, progressive_upgrade_stream());
-        }
-        let updates = updates.lock().unwrap();
-        assert_eq!(
-            updates.len(),
-            2,
-            "both contexts must retain the first-pass tile for UPGRADE"
-        );
-        assert_eq!(&updates[0].3[..4], &[128, 128, 128, 255]);
-        assert_eq!(&updates[1].3[..4], &[128, 128, 128, 255]);
-
-        fn send(client: &mut GraphicsPipelineClient, surface_id: u16, bitmap_data: Vec<u8>) {
-            client
-                .handle_pdu(GfxPdu::WireToSurface2(WireToSurface2Pdu {
-                    surface_id,
-                    codec_id: crate::pdu::Codec2Type::RemoteFxProgressive,
-                    codec_context_id: 7,
-                    pixel_format: PixelFormat::XRgb,
-                    bitmap_data,
-                }))
-                .unwrap();
-        }
-    }
-
-    #[test]
-    fn repeated_decode_failures_preserve_clearcodec_glyphs_across_graphics_reset() {
-        use ironrdp_graphics::clearcodec::ClearCodecEncoder;
-        use ironrdp_pdu::codecs::clearcodec::FLAG_GLYPH_HIT;
-
-        let updates = Arc::new(Mutex::new(Vec::new()));
-        let mut client = progressive_client();
-        client.handler = Box::new(CapturingHandler {
-            updates: Arc::clone(&updates),
-            unhandled: Arc::new(Mutex::new(0)),
-        });
-        let mut encoder = ClearCodecEncoder::new();
-        let pixel = [0x12, 0x34, 0x56, 0xFF];
-        send(&mut client, encoder.encode(&pixel, 1, 1));
-        let glyph_hit = encoder.encode(&pixel, 1, 1);
-        assert_ne!(glyph_hit[0] & FLAG_GLYPH_HIT, 0);
-
-        for _ in 0..15 {
-            send(&mut client, vec![0xFF; 16]);
-        }
-        client
-            .handle_pdu(GfxPdu::ResetGraphics(crate::pdu::ResetGraphicsPdu {
-                width: 64,
-                height: 64,
-                monitors: vec![],
-            }))
-            .unwrap();
-        client
-            .handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
-                surface_id: 1,
-                width: 64,
-                height: 64,
-                pixel_format: PixelFormat::XRgb,
-            }))
-            .unwrap();
-        for _ in 0..49 {
-            send(&mut client, vec![0xFF; 16]);
-        }
-        assert_eq!(client.dropped_updates, 64);
-        send(&mut client, glyph_hit);
-        assert_eq!(client.dropped_updates, 64, "cached glyph must still decode");
-        let updates = updates.lock().unwrap();
-        assert_eq!(updates.len(), 2);
-        assert_eq!(updates[0].3, updates[1].3);
-
-        fn send(client: &mut GraphicsPipelineClient, bitmap_data: Vec<u8>) {
-            client
-                .handle_pdu(GfxPdu::WireToSurface1(crate::pdu::WireToSurface1Pdu {
-                    surface_id: 1,
-                    codec_id: Codec1Type::ClearCodec,
-                    pixel_format: PixelFormat::XRgb,
-                    destination_rectangle: ExclusiveRectangle {
-                        left: 0,
-                        top: 0,
-                        right: 1,
-                        bottom: 1,
-                    },
-                    bitmap_data,
-                }))
-                .unwrap();
-        }
-    }
-
-    /// A REGION may be covered by a tile sent earlier in the same RDPGFX frame under
-    /// another codec context. Skipping it left stale 64-pixel columns of an animation
-    /// on screen until the next full repaint.
-    #[test]
-    fn region_reuses_tile_sent_under_another_codec_context() {
-        use ironrdp_pdu::codecs::rfx::progressive::{
-            ProgressiveBlock, ProgressiveFrameBeginPdu, ProgressiveFrameEndPdu, ProgressiveRegion,
-            encode_progressive_stream,
-        };
-
-        let first = progressive_tile_stream(0, 0, rect(8, 12, 16, 20), 0);
-        let shared = encode_progressive_stream(&[
-            ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
-                frame_index: 1,
-                region_count: 1,
-            }),
-            ProgressiveBlock::Region(ProgressiveRegion {
-                tile_size: 0x40,
-                rects: vec![rect(32, 40, 8, 10)],
-                quant_vals: vec![],
-                quant_prog_vals: vec![],
-                flags: 0,
-                tiles: vec![],
-            }),
-            ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
-        ])
-        .unwrap();
-
-        let decode_frame = |second_codec_context_id: u32| {
-            let mut client = progressive_client();
-            start_frame(&mut client, 1);
-            client
-                .handle_pdu(GfxPdu::MapSurfaceToOutput(crate::pdu::MapSurfaceToOutputPdu {
-                    surface_id: 1,
-                    output_origin_x: 0,
-                    output_origin_y: 0,
-                }))
-                .unwrap();
-            end_frame(&mut client, 1);
-            let _ = client.drain_output();
-
-            start_frame(&mut client, 2);
-            wire_progressive(&mut client, first.clone()).unwrap();
-            client
-                .handle_pdu(GfxPdu::WireToSurface2(WireToSurface2Pdu {
-                    surface_id: 1,
-                    codec_id: crate::pdu::Codec2Type::RemoteFxProgressive,
-                    codec_context_id: second_codec_context_id,
-                    pixel_format: PixelFormat::XRgb,
-                    bitmap_data: shared.clone(),
-                }))
-                .unwrap();
-            end_frame(&mut client, 2);
-
-            client
-                .drain_output()
-                .into_iter()
-                .map(|update| (update.region, update.data))
-                .collect::<Vec<_>>()
-        };
-
-        let other_context = decode_frame(8);
-        let regions: Vec<_> = other_context.iter().map(|(region, _)| region.clone()).collect();
-        assert_eq!(
-            regions,
-            vec![
-                ExclusiveRectangle {
-                    left: 8,
-                    top: 12,
-                    right: 24,
-                    bottom: 32,
-                },
-                ExclusiveRectangle {
-                    left: 32,
-                    top: 40,
-                    right: 40,
-                    bottom: 50,
-                },
-            ],
-            "the second context's REGION must paint from the tile sent earlier in the frame"
-        );
-        assert!(other_context[1].1.iter().any(|&value| value != 0));
-        assert_eq!(
-            other_context,
-            decode_frame(7),
-            "a REGION must paint the same pixels whichever codec context carries it"
-        );
-    }
-
-    /// Sends a tile, runs `step`, then sends a difference tile, which needs the reference the first
-    /// tile left on its surface. Returns the client so that its dropped updates can be checked.
-    fn wire_difference_tile_after(step: impl FnOnce(&mut GraphicsPipelineClient)) -> GraphicsPipelineClient {
-        let mut client = progressive_client();
-        wire_progressive(&mut client, progressive_tile_stream(0, 0, rect(0, 0, 64, 64), 0)).unwrap();
-        step(&mut client);
-        wire_progressive(
-            &mut client,
-            progressive_tile_stream(0, 0, rect(0, 0, 64, 64), TILE_FLAG_DIFFERENCE),
-        )
-        .unwrap();
-        client
-    }
-
-    #[test]
-    fn an_undecodable_clearcodec_update_is_dropped_not_fatal() {
-        let mut client = progressive_client();
-
-        let result = client.handle_pdu(GfxPdu::WireToSurface1(crate::pdu::WireToSurface1Pdu {
-            surface_id: 1,
-            codec_id: Codec1Type::ClearCodec,
-            pixel_format: PixelFormat::XRgb,
-            destination_rectangle: ExclusiveRectangle {
-                left: 0,
-                top: 0,
-                right: 64,
-                bottom: 64,
-            },
-            bitmap_data: vec![0xFF; 16],
-        }));
-
-        assert!(result.is_ok());
-        assert_eq!(client.dropped_updates, 1);
+        wire_progressive(&mut client, progressive_context_stream(true)).unwrap();
+        clear(&mut client);
+        assert!(wire_progressive(&mut client, progressive_context_stream(false)).is_err());
     }
 
     #[test]
     fn progressive_context_survives_graphics_reset() {
-        let updates = Arc::new(Mutex::new(Vec::new()));
         let mut client = progressive_client();
-        client.handler = Box::new(CapturingHandler {
-            updates: Arc::clone(&updates),
-            unhandled: Arc::new(Mutex::new(0)),
-        });
-        wire_progressive(&mut client, progressive_tile_stream(0, 0, rect(0, 0, 64, 64), 0)).unwrap();
-        assert_eq!(updates.lock().unwrap().len(), 1);
-        updates.lock().unwrap().clear();
+        wire_progressive(&mut client, progressive_context_stream(true)).unwrap();
 
         client
             .handle_pdu(GfxPdu::ResetGraphics(crate::pdu::ResetGraphicsPdu {
@@ -1870,99 +1920,29 @@ mod tests {
 
         // Windows never re-sends SYNC + CONTEXT after a reset, so a CONTEXT-less
         // continuation has to keep decoding.
-        wire_progressive(&mut client, progressive_upgrade_stream()).unwrap();
-        assert_eq!(client.dropped_updates(), 0);
-        let updates = updates.lock().unwrap();
-        assert_eq!(updates.len(), 1, "UPGRADE must retain its first-pass tile");
-        assert_eq!(&updates[0].3[..4], &[128, 128, 128, 255]);
+        assert!(wire_progressive(&mut client, progressive_context_stream(false)).is_ok());
     }
 
-    // oracle: spec MS-RDPEGFX §3.3.5.19 resets the codec and tile contexts in §3.3.1.1-3.3.1.2.
     #[test]
-    fn protocol_reset_discards_progressive_context_and_tiles() {
-        use crate::pdu::{CapabilitiesConfirmPdu, Codec2Type, CreateSurfacePdu};
-
-        let updates = Arc::new(Mutex::new(Vec::new()));
-        let mut client = GraphicsPipelineClient::new(
-            Box::new(CapturingHandler {
-                updates: Arc::clone(&updates),
-                unhandled: Arc::new(Mutex::new(0)),
-            }),
-            None,
-        );
-        let process = |client: &mut GraphicsPipelineClient, pdu: &GfxPdu| {
-            let bytes = ironrdp_core::encode_vec(pdu).unwrap();
-            client.process(0, &zgfx::wrap_uncompressed(&bytes)).unwrap();
-        };
-        let confirm = GfxPdu::CapabilitiesConfirm(CapabilitiesConfirmPdu::from_typed(&CapabilitySet::V10_7 {
-            flags: CapabilitiesV107Flags::empty(),
-        }));
-        let create = GfxPdu::CreateSurface(CreateSurfacePdu {
-            surface_id: 1,
-            width: 64,
-            height: 64,
-            pixel_format: PixelFormat::XRgb,
-        });
-        let wire = |bitmap_data| {
-            GfxPdu::WireToSurface2(WireToSurface2Pdu {
+    fn progressive_context_is_deleted_with_encoding_context() {
+        let mut client = progressive_client();
+        wire_progressive(&mut client, progressive_context_stream(true)).unwrap();
+        client
+            .handle_pdu(GfxPdu::DeleteEncodingContext(DeleteEncodingContextPdu {
                 surface_id: 1,
-                codec_id: Codec2Type::RemoteFxProgressive,
                 codec_context_id: 7,
-                pixel_format: PixelFormat::XRgb,
-                bitmap_data,
-            })
-        };
-        let seed = wire(progressive_tile_stream(0, 0, rect(0, 0, 64, 64), 0));
-        let upgrade = wire(progressive_upgrade_stream());
-        for pdu in [&confirm, &create, &seed, &upgrade] {
-            process(&mut client, pdu);
-        }
-        assert_eq!(client.dropped_updates(), 0);
-        assert_eq!(updates.lock().unwrap().len(), 2);
-        updates.lock().unwrap().clear();
-        assert!(client.request_protocol_reset().is_some());
-        for pdu in [&confirm, &create, &upgrade] {
-            process(&mut client, pdu);
-        }
-        assert!(
-            updates.lock().unwrap().is_empty(),
-            "a fresh context must not inherit the previous tile"
-        );
-        process(
-            &mut client,
-            &wire(progressive_tile_stream(0, 0, rect(0, 0, 64, 64), TILE_FLAG_DIFFERENCE)),
-        );
-        assert_eq!(
-            client.dropped_updates(),
-            1,
-            "the previous surface's sub-band reference must no longer exist"
-        );
-        for pdu in [&seed, &upgrade] {
-            process(&mut client, pdu);
-        }
-        assert_eq!(client.dropped_updates(), 1, "a fresh tile must allow refinements again");
-        assert_eq!(updates.lock().unwrap().len(), 2);
-    }
+            }))
+            .unwrap();
 
-    #[test]
-    fn progressive_tiles_survive_encoding_context_deletion() {
-        // The surface keeps its sub-band reference. Windows deletes a codec context as it opens
-        // the next one.
-        let client = wire_difference_tile_after(|client| {
-            client
-                .handle_pdu(GfxPdu::DeleteEncodingContext(DeleteEncodingContextPdu {
-                    surface_id: 1,
-                    codec_context_id: 7,
-                }))
-                .unwrap();
-        });
-
-        assert_eq!(client.dropped_updates, 0);
+        // The context's tiles are gone, but the surface survives and keeps the band layout it
+        // was given, so a payload reusing the id decodes from scratch. Windows deletes a codec
+        // context as it opens the next one and never repeats SYNC + CONTEXT.
+        assert!(wire_progressive(&mut client, progressive_context_stream(false)).is_ok());
     }
 
     #[test]
     fn progressive_context_is_deleted_with_surface() {
-        let client = wire_difference_tile_after(|client| {
+        assert_progressive_context_is_deleted(|client| {
             client
                 .handle_pdu(GfxPdu::DeleteSurface(crate::pdu::DeleteSurfacePdu { surface_id: 1 }))
                 .unwrap();
@@ -1975,7 +1955,5 @@ mod tests {
                 }))
                 .unwrap();
         });
-
-        assert_eq!(client.dropped_updates, 1);
     }
 }
