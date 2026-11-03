@@ -162,7 +162,7 @@ jobs:
             echo "::error::release $TAG already exists"
             exit 1
           fi
-          gh release create "$TAG" --draft --verify-tag --target "$RELEASE_SHA" --latest=false \
+          gh release create "$TAG" --draft --verify-tag --latest=false \
             --title "$TAG" --notes-file RELEASE.md
           gh release upload "$TAG" ./*.tgz SHA256SUMS UPSTREAM.patch
           # The tag must still point at the commit that was built.
