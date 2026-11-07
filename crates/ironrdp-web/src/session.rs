@@ -22,7 +22,8 @@ use ironrdp::connector::credssp::KerberosConfig;
 use ironrdp::connector::{self, ClientConnector, Credentials};
 use ironrdp::displaycontrol::client::DisplayControlClient;
 use ironrdp::dvc::DrdynvcClient;
-use ironrdp::egfx::client::{BitmapUpdate, GraphicsPipelineClient, GraphicsPipelineHandler};
+use ironrdp::egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
+use ironrdp::egfx::compositor::OutputUpdate;
 use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::pdu::geometry::InclusiveRectangle;
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
@@ -552,20 +553,28 @@ impl GraphicsPipelineHandler for WasmGraphicsPipelineHandler {
         }
     }
 
-    fn on_bitmap_updated(&mut self, update: &BitmapUpdate) {
-        let rect = &update.destination_rectangle;
-        if update.data.is_empty() || rect.right <= rect.left || rect.bottom <= rect.top {
-            return;
+    // Draws the compositor's output rather than codec tiles: solid fills, scrolls and cache blits change the
+    // screen too, and the regions are already mapped from surface to output coordinates.
+    fn wants_frame_output(&self) -> bool {
+        true
+    }
+
+    fn on_frame_output(&mut self, updates: &[OutputUpdate]) {
+        for update in updates {
+            let rect = &update.region;
+            if update.data.is_empty() || rect.right <= rect.left || rect.bottom <= rect.top {
+                continue;
+            }
+            self.emit(
+                InclusiveRectangle {
+                    left: rect.left,
+                    top: rect.top,
+                    right: rect.right - 1,
+                    bottom: rect.bottom - 1,
+                },
+                update.data.clone(),
+            );
         }
-        self.emit(
-            InclusiveRectangle {
-                left: rect.left,
-                top: rect.top,
-                right: rect.right - 1,
-                bottom: rect.bottom - 1,
-            },
-            update.data.clone(),
-        );
     }
 }
 

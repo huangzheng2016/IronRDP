@@ -278,6 +278,23 @@ pub trait GraphicsPipelineHandler: Send {
     /// and this notification belong to the same logical frame.
     fn on_frame_complete(&mut self, _frame_id: u32) {}
 
+    /// Whether [`GraphicsPipelineHandler::on_frame_output`] receives the composed output of each frame
+    ///
+    /// When `true`, the client drains its compositor at every `EndFrame` and
+    /// [`GraphicsPipelineClient::drain_output`] returns nothing.
+    fn wants_frame_output(&self) -> bool {
+        false
+    }
+
+    /// Called at `EndFrame` with the output regions the frame changed
+    ///
+    /// Unlike [`GraphicsPipelineHandler::on_bitmap_updated`], which carries only
+    /// codec output in surface coordinates, these regions include solid fills,
+    /// surface-to-surface copies and cache blits, and are in output coordinates.
+    /// A renderer that draws them needs nothing from `on_bitmap_updated`.
+    /// Only called when [`GraphicsPipelineHandler::wants_frame_output`] returns `true`.
+    fn on_frame_output(&mut self, _updates: &[OutputUpdate]) {}
+
     /// Called when the EGFX channel is closed
     fn on_close(&mut self) {}
 
@@ -1129,6 +1146,13 @@ impl GraphicsPipelineClient {
 
         // Commit the frame's compositor deltas so `drain_output` can surface them.
         self.compositor.end_frame();
+
+        if self.handler.wants_frame_output() {
+            let updates = self.compositor.drain_output();
+            if !updates.is_empty() {
+                self.handler.on_frame_output(&updates);
+            }
+        }
 
         self.handler.on_frame_complete(frame_id);
 
@@ -2290,5 +2314,132 @@ mod tests {
         });
 
         assert_eq!(client.dropped_updates, 1);
+    }
+
+    type CapturedOutput = (ExclusiveRectangle, Vec<u8>);
+
+    struct FrameOutputHandler {
+        outputs: Arc<Mutex<Vec<CapturedOutput>>>,
+    }
+    impl GraphicsPipelineHandler for FrameOutputHandler {
+        fn wants_frame_output(&self) -> bool {
+            true
+        }
+        fn on_frame_output(&mut self, updates: &[OutputUpdate]) {
+            let mut outputs = self.outputs.lock().expect("outputs lock");
+            outputs.extend(
+                updates
+                    .iter()
+                    .map(|update| (update.region.clone(), update.data.clone())),
+            );
+        }
+    }
+
+    /// Solid fills and cache blits change the screen without any codec output, so
+    /// a renderer that draws only `on_bitmap_updated` leaves those regions stale.
+    /// The frame output carries them, in output coordinates.
+    #[test]
+    fn frame_output_carries_fills_and_cache_blits_in_output_coordinates() {
+        let outputs = Arc::new(Mutex::new(Vec::new()));
+        let mut client = GraphicsPipelineClient::new(
+            Box::new(FrameOutputHandler {
+                outputs: Arc::clone(&outputs),
+            }),
+            None,
+        );
+        client
+            .handle_pdu(GfxPdu::ResetGraphics(crate::pdu::ResetGraphicsPdu {
+                width: 256,
+                height: 256,
+                monitors: vec![],
+            }))
+            .unwrap();
+        client
+            .handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+                surface_id: 1,
+                width: 128,
+                height: 128,
+                pixel_format: PixelFormat::XRgb,
+            }))
+            .unwrap();
+        client
+            .handle_pdu(GfxPdu::MapSurfaceToOutput(crate::pdu::MapSurfaceToOutputPdu {
+                surface_id: 1,
+                output_origin_x: 64,
+                output_origin_y: 32,
+            }))
+            .unwrap();
+        // Mapping repaints the whole surface; that frame is not what this test checks.
+        start_frame(&mut client, 1);
+        end_frame(&mut client, 1);
+        outputs.lock().expect("outputs lock").clear();
+
+        start_frame(&mut client, 2);
+        client
+            .handle_pdu(GfxPdu::SolidFill(SolidFillPdu {
+                surface_id: 1,
+                fill_pixel: crate::pdu::Color {
+                    b: 0x30,
+                    g: 0x20,
+                    r: 0x10,
+                    xa: 0,
+                },
+                rectangles: vec![ExclusiveRectangle {
+                    left: 0,
+                    top: 0,
+                    right: 4,
+                    bottom: 2,
+                }],
+            }))
+            .unwrap();
+        client
+            .handle_pdu(GfxPdu::SurfaceToCache(SurfaceToCachePdu {
+                surface_id: 1,
+                cache_key: 1,
+                cache_slot: 3,
+                source_rectangle: ExclusiveRectangle {
+                    left: 0,
+                    top: 0,
+                    right: 4,
+                    bottom: 2,
+                },
+            }))
+            .unwrap();
+        client
+            .handle_pdu(GfxPdu::CacheToSurface(CacheToSurfacePdu {
+                cache_slot: 3,
+                surface_id: 1,
+                destination_points: vec![crate::pdu::Point { x: 100, y: 50 }],
+            }))
+            .unwrap();
+        assert!(
+            outputs.lock().expect("outputs lock").is_empty(),
+            "output is delivered at EndFrame"
+        );
+        end_frame(&mut client, 2);
+
+        let outputs = outputs.lock().expect("outputs lock");
+        let pixel = [0x10, 0x20, 0x30, 0xFF].repeat(8);
+        let fill = ExclusiveRectangle {
+            left: 64,
+            top: 32,
+            right: 68,
+            bottom: 34,
+        };
+        let blit = ExclusiveRectangle {
+            left: 164,
+            top: 82,
+            right: 168,
+            bottom: 84,
+        };
+        assert!(
+            outputs.contains(&(fill, pixel.clone())),
+            "solid fill missing: {outputs:?}"
+        );
+        assert!(outputs.contains(&(blit, pixel)), "cache blit missing: {outputs:?}");
+        assert!(
+            client.drain_output().is_empty(),
+            "the handler already took the frame output"
+        );
     }
 }
