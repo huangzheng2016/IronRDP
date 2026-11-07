@@ -1,0 +1,179 @@
+name: Web EGFX release
+
+# Builds the unofficial @devolutions/iron-remote-desktop-rdp package from this fork and
+# publishes it as a GitHub release. Push a tag such as v0.7.0-egfx.3 to run it. The release
+# notes are read from .github/web-egfx-release-notes/<tag>.md, which must exist at the tag,
+# because an immutable release cannot be edited after it is published.
+
+on:
+  push:
+    tags:
+      - 'v*-egfx.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to release (for example v0.7.0-egfx.3)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: web-egfx-release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RUST_VERSION: '1.94.1'
+  WASM_PACK_VERSION: '0.15.1'
+  NODE_VERSION: '24'
+  UPSTREAM_BASE: e45f68c7e52297ca50d33b44c0ace36c9940fbe6
+  PACKAGE_NAME: '@devolutions/iron-remote-desktop-rdp'
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check the tag name
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)-egfx\.[0-9]+$ ]]; then
+            echo "::error::Tag '$TAG' does not match v<x.y.z>-egfx.<n>"
+            exit 1
+          fi
+          echo "PACKAGE_VERSION=${BASH_REMATCH[1]}" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check the upstream base
+        run: |
+          set -euo pipefail
+          echo "RELEASE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          git merge-base --is-ancestor "$UPSTREAM_BASE" HEAD
+          test -f ".github/web-egfx-release-notes/${TAG}.md"
+
+      - name: Set up Rust
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target wasm32-unknown-unknown
+          rustup default "$RUST_VERSION"
+          rustc --version
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --version "$WASM_PACK_VERSION" --locked
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # The same steps as `cargo xtask web build` (xtask/src/web.rs), without the demo client.
+      # Source paths are remapped so the WebAssembly module embeds no runner paths.
+      - name: Build the WebAssembly module
+        working-directory: crates/ironrdp-web
+        run: |
+          set -euo pipefail
+          export RUSTFLAGS="-Ctarget-feature=+simd128,+bulk-memory --cfg getrandom_backend=\"wasm_js\" --remap-path-prefix=${GITHUB_WORKSPACE}=/src --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=${RUSTUP_HOME:-$HOME/.rustup}=/rustup"
+          wasm-pack build --target web -- --locked
+
+          # Vite does not handle `new URL(url, import.meta.url)`, so import the module as an asset URL.
+          file=pkg/ironrdp_web.js
+          grep -q "new URL('ironrdp_web_bg.wasm', import.meta.url)" "$file"
+          sed -i "s|new URL('ironrdp_web_bg.wasm', import.meta.url)|wasmUrl|" "$file"
+          { printf "import wasmUrl from './ironrdp_web_bg.wasm?url';\n\n"; cat "$file"; } > "$file.patched"
+          mv "$file.patched" "$file"
+          head -n 3 "$file"
+          grep -q 'wasmUrl' "$file"
+
+      - name: Build the npm package
+        working-directory: web-client/iron-remote-desktop-rdp
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts
+          npm run build-alone
+          cd dist
+          npm pack
+          ls -l
+
+      - name: Verify the package
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          cp web-client/iron-remote-desktop-rdp/dist/*.tgz "$RUNNER_TEMP/out/"
+          cd "$RUNNER_TEMP/out"
+          test "$(ls -1 *.tgz | wc -l)" -eq 1
+          tar -xzf ./*.tgz
+          node -e '
+            const pkg = require("./package/package.json");
+            const expected = process.env.PACKAGE_VERSION;
+            if (pkg.name !== process.env.PACKAGE_NAME) { throw new Error("unexpected name " + pkg.name); }
+            if (pkg.version !== expected) { throw new Error("unexpected version " + pkg.version); }
+            const scripts = Object.keys(pkg.scripts || {});
+            const lifecycle = ["preinstall", "install", "postinstall", "prepare", "prepublish", "prepack", "postpack"];
+            if (scripts.some((name) => lifecycle.includes(name))) { throw new Error("package has install scripts"); }
+          '
+          if grep -rEq '/(home|Users|runner)/' package/iron-remote-desktop-rdp.js; then
+            echo "::error::the package embeds a local path"
+            exit 1
+          fi
+          # The WebAssembly module is inlined, so also check the module itself.
+          if strings "$GITHUB_WORKSPACE/crates/ironrdp-web/pkg/ironrdp_web_bg.wasm" | grep -E '/(home|Users|runner)/'; then
+            echo "::error::the WebAssembly module embeds a local path"
+            exit 1
+          fi
+          rm -r package
+
+      - name: Collect the assets
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/out"
+          git -C "$GITHUB_WORKSPACE" diff --binary "$UPSTREAM_BASE" HEAD > UPSTREAM.patch
+          sha256sum ./*.tgz > SHA256SUMS
+          cat SHA256SUMS
+          cp "$GITHUB_WORKSPACE/.github/web-egfx-release-notes/${TAG}.md" RELEASE.md
+          echo "ASSET_DIR=$RUNNER_TEMP/out" >> "$GITHUB_ENV"
+
+      - name: Attest the package
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ env.ASSET_DIR }}/*.tgz
+
+      # Draft first, upload, then publish: a published immutable release accepts no new assets.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # The asset directory is not a checkout, so gh needs the repository named explicitly.
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cd "$ASSET_DIR"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::release $TAG already exists"
+            exit 1
+          fi
+          gh release create "$TAG" --draft --verify-tag --latest=false \
+            --title "$TAG" --notes-file RELEASE.md
+          gh release upload "$TAG" ./*.tgz SHA256SUMS UPSTREAM.patch
+          # The tag must still point at the commit that was built.
+          current=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" --jq .object.sha)
+          type=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" --jq .object.type)
+          if [ "$type" = tag ]; then
+            current=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${current}" --jq .object.sha)
+          fi
+          if [ "$current" != "$RELEASE_SHA" ]; then
+            echo "::error::tag $TAG now points at $current, not the built commit $RELEASE_SHA"
+            gh release delete "$TAG" --yes
+            exit 1
+          fi
+          gh release edit "$TAG" --draft=false

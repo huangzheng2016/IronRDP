@@ -30,6 +30,7 @@ use ironrdp::connector::credssp::{KdcResolution, KerberosConfig};
 use ironrdp::connector::{self, ClientConnector, Credentials};
 use ironrdp::displaycontrol::client::DisplayControlClient;
 use ironrdp::dvc::DrdynvcClient;
+use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
 use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp::pdu::rdp::capability_sets::{BitmapCodecs, client_codecs_capabilities};
@@ -1587,7 +1588,7 @@ fn build_config(
         request_data: None,
         pointer_software_rendering: false,
         multitransport_flags: None,
-        support_dyn_vc_gfx_protocol: false,
+        support_dyn_vc_gfx_protocol: true,
         rdp_version: ironrdp::pdu::gcc::RdpVersion::V5_PLUS,
         performance_flags: PerformanceFlags::default(),
         desktop_scale_factor: 0,
@@ -1738,11 +1739,15 @@ async fn connect(
         );
     }
 
+    struct NoopGraphicsPipelineHandler;
+    impl GraphicsPipelineHandler for NoopGraphicsPipelineHandler {}
+
+    let mut dynamic_channels = DrdynvcClient::new()
+        .with_dynamic_channel(GraphicsPipelineClient::new(Box::new(NoopGraphicsPipelineHandler), None));
     if use_display_control {
-        connector.attach_static_channel(
-            DrdynvcClient::new().with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new()))),
-        );
+        dynamic_channels = dynamic_channels.with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
     }
+    connector.attach_static_channel(dynamic_channels);
 
     let kerberos_config = url::Url::parse(kdc_proxy_url.unwrap_or_default().as_str())
         .ok()
@@ -2103,6 +2108,15 @@ mod tests {
             vmconnect: None,
             kerberos_config: None,
         }
+    }
+
+    #[test]
+    fn connector_config_enables_the_graphics_pipeline() {
+        let config = connector_config(SecurityConfig {
+            enable_credssp: true,
+            enable_standard_rdp_security: false,
+        });
+        assert!(config.support_dyn_vc_gfx_protocol);
     }
 
     #[test]
