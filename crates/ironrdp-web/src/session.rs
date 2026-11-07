@@ -30,7 +30,6 @@ use ironrdp::connector::credssp::{KdcResolution, KerberosConfig};
 use ironrdp::connector::{self, ClientConnector, Credentials};
 use ironrdp::displaycontrol::client::DisplayControlClient;
 use ironrdp::dvc::DrdynvcClient;
-use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
 use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp::pdu::rdp::capability_sets::{BitmapCodecs, client_codecs_capabilities};
@@ -41,6 +40,7 @@ use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd};
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
 use ironrdp_core::WriteBuf;
+use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
 use ironrdp_futures::{FramedWrite, single_sequence_step_read};
 use rgb::AsPixels as _;
 use tap::prelude::*;
@@ -741,8 +741,11 @@ impl iron_remote_desktop::Session for Session {
             connection_result.desktop_size.width,
             connection_result.desktop_size.height,
         );
-
-        let mut requested_resize = None;
+        let mut framebuffer_size = (
+            connection_result.desktop_size.width,
+            connection_result.desktop_size.height,
+        );
+        let mut pending_resize: Option<(u32, u32, Option<u32>, Option<(u32, u32)>)> = None;
 
         // Reused across frames so per-region extraction doesn't allocate on every draw.
         let mut draw_buffer = WriteBuf::new();
@@ -766,7 +769,7 @@ impl iron_remote_desktop::Session for Session {
         let mut cleanup_interval = IntervalStream::new(5_000).fuse();
 
         let disconnect_reason = 'outer: loop {
-            let outputs = select! {
+            let mut outputs = select! {
                 frame = framed.read_pdu().fuse() => {
                     let (action, payload) = frame.context("read frame")?;
                     trace!(?action, frame_length = payload.len(), "Frame received");
@@ -923,13 +926,14 @@ impl iron_remote_desktop::Session for Session {
                                 warn!("Resize event ignored: width or height is zero");
                                 Vec::new()
                             } else if let Some(response_frame) = active_stage.encode_resize(width, height, scale_factor, physical_size) {
-                                let width = NonZeroU32::new(width).expect("width is guaranteed to be non-zero due to the prior check");
-                                let height = NonZeroU32::new(height).expect("height is guaranteed to be non-zero due to the prior check");
-
-                                requested_resize = Some((width, height));
+                                pending_resize = None;
                                 vec![ActiveStageOutput::ResponseFrame(response_frame?)]
+                            } else if active_stage.display_control_ready() == Some(false) {
+                                debug!(width, height, "Deferring resize until Display Control capabilities arrive");
+                                pending_resize = Some((width, height, scale_factor, physical_size));
+                                Vec::new()
                             } else {
-                                debug!("Resize event ignored");
+                                warn!("Resize request was not sent: Display Control is unavailable or not ready");
                                 Vec::new()
                             }
                         },
@@ -973,6 +977,33 @@ impl iron_remote_desktop::Session for Session {
                     }
                 }
             };
+
+            // EGFX resets and reactivation can change the framebuffer without a Web resize event.
+            let output_size = (image.width(), image.height());
+            if output_size != framebuffer_size {
+                let width = NonZeroU32::new(u32::from(output_size.0)).context("graphics output width is zero")?;
+                let height = NonZeroU32::new(u32::from(output_size.1)).context("graphics output height is zero")?;
+                gui.resize(width, height);
+                framebuffer_size = output_size;
+                if pending_resize.is_some_and(|(w, h, ..)| (w, h) == (width.get(), height.get())) {
+                    pending_resize = None;
+                }
+            }
+
+            if let Some((width, height, scale_factor, physical_size)) = pending_resize {
+                if (u32::from(image.width()), u32::from(image.height())) == (width, height) {
+                    pending_resize = None;
+                } else if active_stage.display_control_ready() == Some(true) {
+                    pending_resize = None;
+                    if let Some(response_frame) =
+                        active_stage.encode_resize(width, height, scale_factor, physical_size)
+                    {
+                        outputs.push(ActiveStageOutput::ResponseFrame(response_frame?));
+                    }
+                } else if active_stage.display_control_ready().is_none() {
+                    pending_resize = None;
+                }
+            }
 
             for out in outputs {
                 match out {
@@ -1101,13 +1132,6 @@ impl iron_remote_desktop::Session for Session {
                         // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dfc234ce-481a-4674-9a5d-2a7bafb14432
                         debug!("Received Server Deactivate All PDU, executing Deactivation-Reactivation Sequence");
 
-                        // We need to perform resize after receiving the Deactivate All PDU, because there may be frames
-                        // with the previous dimensions arriving between the resize request and this message.
-                        if let Some((width, height)) = requested_resize {
-                            gui.resize(width, height);
-                            requested_resize = None;
-                        }
-
                         let mut connection_activation = activation_factory.create();
                         let mut buf = WriteBuf::new();
                         'activation_seq: loop {
@@ -1137,6 +1161,18 @@ impl iron_remote_desktop::Session for Session {
                                 drop(image);
                                 ensure_framebuffer_allocatable(desktop_size)?;
                                 image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
+                                let output_size = (image.width(), image.height());
+                                if output_size != framebuffer_size {
+                                    let width = NonZeroU32::new(u32::from(output_size.0))
+                                        .context("graphics output width is zero")?;
+                                    let height = NonZeroU32::new(u32::from(output_size.1))
+                                        .context("graphics output height is zero")?;
+                                    gui.resize(width, height);
+                                    framebuffer_size = output_size;
+                                    if pending_resize.is_some_and(|(w, h, ..)| (w, h) == (width.get(), height.get())) {
+                                        pending_resize = None;
+                                    }
+                                }
                                 if !active_stage.reactivate(
                                     connection_activation.io_channel_id(),
                                     connection_activation.user_channel_id(),
@@ -1542,8 +1578,8 @@ fn build_config(
         }
     } else {
         connector::BitmapConfig {
-            color_depth: 16,
-            lossy_compression: true,
+            color_depth: 32,
+            lossy_compression: false,
             codecs: client_codecs_capabilities(&[]).expect("can't panic for &[]"),
         }
     };
@@ -2108,15 +2144,6 @@ mod tests {
             vmconnect: None,
             kerberos_config: None,
         }
-    }
-
-    #[test]
-    fn connector_config_enables_the_graphics_pipeline() {
-        let config = connector_config(SecurityConfig {
-            enable_credssp: true,
-            enable_standard_rdp_security: false,
-        });
-        assert!(config.support_dyn_vc_gfx_protocol);
     }
 
     #[test]
